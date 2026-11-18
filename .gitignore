@@ -1,0 +1,12 @@
+research/
+.DS_Store
+xcuserdata/
+DerivedData/
+build/
+*.xcuserstate
+
+
+.claude/
+.tokensave/
+.serena/
+.headroom*
