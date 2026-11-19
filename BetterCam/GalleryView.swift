@@ -1,3 +1,4 @@
+import os
 import Photos
 import PhotosUI
 import SwiftUI
@@ -137,8 +138,13 @@ struct PhotoView: View {
             recipe = library.recipe(id)
             let url = library.raw(id), crop = recipe.crop
             let loaded = await Task.detached(priority: .userInitiated) { () -> (CIImage, Look.Analysis)? in
+                let t0 = Date()
                 guard let b = Look.decode(url, crop: crop, maxSide: 1600).flatMap(Look.materialize) else { return nil }
-                return (b, Look.analyze(b, subject: true))
+                let a = Look.analyze(b, subject: true)
+                #if DEBUG
+                diag.info("editor load \(Date().timeIntervalSince(t0), format: .fixed(precision: 2))s \(Look.decodeReport(b), privacy: .public) mem \(Look.footprintMB(), format: .fixed(precision: 0))MB")
+                #endif
+                return (b, a)
             }.value
             base = loaded?.0
             analysis = loaded?.1
@@ -216,7 +222,11 @@ struct PhotoView: View {
         repeat {
             r = recipe
             let a = analysis
+            let t0 = Date()
             image = await Task.detached(priority: .userInitiated) { Look.uiImage(Look.apply(r, to: base, analysis: a)) }.value
+            #if DEBUG
+            diag.debug("slider render \(Date().timeIntervalSince(t0) * 1000, format: .fixed(precision: 0))ms exposure \(r.exposure)")
+            #endif
         } while r != recipe
     }
 
@@ -224,11 +234,13 @@ struct PhotoView: View {
         exporting = true
         defer { exporting = false }
         let r = recipe, url = library.raw(id)
+        let t0 = Date()
         let data = await Task.detached(priority: .userInitiated) {
             Look.decode(url, crop: r.crop).flatMap {
                 Look.jpeg(Look.apply(r, to: $0).settingProperties(Look.exportProperties(source: url, recipe: r)), quality: 0.95)
             }
         }.value
+        diag.info("export \(Date().timeIntervalSince(t0), format: .fixed(precision: 2))s \(data?.count ?? 0)B mem \(Look.footprintMB(), format: .fixed(precision: 0))MB")
         guard let data else { message = "Couldn't render this photo."; return }
 
         let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
@@ -246,3 +258,5 @@ struct PhotoView: View {
         }
     }
 }
+
+private let diag = Logger(subsystem: "bettercam", category: "diag")

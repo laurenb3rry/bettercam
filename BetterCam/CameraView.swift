@@ -9,11 +9,11 @@ struct CameraView: View {
     @State private var showName = false
     @State private var flash = false
     @AppStorage("grid") private var grid = false
+    @AppStorage("rawMode") private var rawMode = Camera.Mode.bayer.rawValue
 
     var body: some View {
         VStack(spacing: 20) {
-            PreviewView(camera: camera) { camera.focus(at: $0) }
-                .scaleEffect(camera.current?.crop ?? 1) // 2× preview = the crop the photo will get
+            PreviewView(camera: camera) { camera.focus(at: $0) } // 2× crop is done on the frames (Camera.captureOutput)
                 .aspectRatio(3 / 4, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 4))
                 // swipe left/right through the film looks, like Instagram story filters
@@ -31,6 +31,17 @@ struct CameraView: View {
                             toggle(flash ? "bolt.fill" : "bolt.slash", on: flash) { flash.toggle() }
                         }
                         toggle("grid", on: grid) { grid.toggle() }
+                        #if DEBUG
+                        Menu { // Phase 2 capture experiment (research/11-phase2-capture.md)
+                            Picker("Capture", selection: $rawMode) {
+                                ForEach(Camera.Mode.allCases) { Text($0.rawValue).tag($0.rawValue) }
+                            }
+                        } label: {
+                            Text(String(rawMode.prefix(1)))
+                                .font(.footnote.weight(.bold)).foregroundStyle(.white)
+                                .frame(width: 34, height: 34).background(.black.opacity(0.35), in: Circle())
+                        }
+                        #endif
                     }
                     .padding(10)
                 }
@@ -89,9 +100,14 @@ struct CameraView: View {
         }
         .task {
             camera.onCapture = { shot in Task { @MainActor in await library.add(shot) } }
+            #if DEBUG
+            camera.start(preferred: lastLens, mode: Camera.Mode(rawValue: rawMode) ?? .bayer)
+            #else
             camera.start(preferred: lastLens)
+            #endif
         }
         .onChange(of: camera.current) { _, stop in if let stop { lastLens = stop.id } }
+        .onChange(of: rawMode) { _, m in camera.mode = Camera.Mode(rawValue: m) ?? .bayer }
         .onChange(of: showGallery) { _, open in camera.paused = open }
         .alert("bettercam", isPresented: Binding { camera.error != nil } set: { if !$0 { camera.error = nil } }) {
             Button("OK") {}

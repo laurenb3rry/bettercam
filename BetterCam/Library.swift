@@ -37,7 +37,9 @@ final class Library: ObservableObject {
     func add(_ shot: Camera.Shot) async {
         let id = newID()
         do { try shot.data.write(to: dir.appending(path: "\(id).\(shot.ext)")) } catch { return }
-        let r = Recipe(filter: shot.filter, crop: shot.crop)
+        var r = Recipe(filter: shot.filter, crop: shot.crop)
+        let src = raw(id) // bias 0 in modes B–D → −1; a −0.70 EXIF bias → −0.30; ProRAW adds Apple's exposure (Look.startingExposure)
+        r.baseExposure = await Task.detached(priority: .utility) { Look.startingExposure(src, captured: true) }.value
         try? JSONEncoder().encode(r).write(to: recipeURL(id))
         await renderThumb(id, r)
         reload()
@@ -54,8 +56,8 @@ final class Library: ObservableObject {
         }.value
         guard ok else { return }
         var r = Recipe()
-        // ponytail: imported RAWs weren't shot 1 stop under like ours; undo the decode's compensation
-        if isRaw { r.baseExposure = -Look.rawCompensation }
+        // imported RAWs weren't shot 1 stop under like ours: undo the decode's compensation (+ ProRAW exposure)
+        if isRaw { r.baseExposure = await Task.detached(priority: .utility) { Look.startingExposure(dst, captured: false) }.value }
         try? JSONEncoder().encode(r).write(to: recipeURL(id))
         await renderThumb(id, r)
         reload()

@@ -72,15 +72,13 @@ enum Look {
     /// We underexpose RAW captures by this much (see Camera) to protect highlights, and restore it at decode.
     static let rawCompensation = 1.0
     /// Bump when rendering changes without recipe units changing: gallery thumbnails re-render, edits are kept.
-    static let version = 12
+    static let version = 18 // 18: white anchored to content (gallery matched viewfinder); 17: Phase 4 Riviera/Sun Study/Alpine/After Hours (research/14); 16: Phase 3B EDITORIAL
     /// Legacy curve only (`legacyCurve`): fixed display white, in stops above mid grey. It assumed RAW clips at ~+4;
     /// the old SDR-clipped decode actually stopped at +2.9…+3.2, so highlights never passed ~0.89.
     /// The calibrated curve instead puts white at each photo's own clip level (`Analysis.clip`).
     static let whiteStops = 4.5
-    /// Share of the hue-preserving curve in the tone map (research §8.2 suggests testing 0.3–0.6).
-    static let hueHold = 0.35
     /// Scales `Grade.saturation` so 1.0 ≈ colorimetric chroma on a ColorChecker (AgX inset/outset alone mutes color).
-    /// Measured by checks/main.swift; re-measure if the curve, inset or hueHold changes.
+    /// Measured by checks/main.swift; re-measure if the curve, inset or Grade.hueHold default changes.
     static let chromaNorm = 0.93
 
     // MARK: - Decode
@@ -89,20 +87,137 @@ enum Look {
     /// ponytail: delete both flags and their branches once Phase 1 is signed off.
     nonisolated(unsafe) static var legacyDecode = false
     nonisolated(unsafe) static var legacyCurve = false
+    /// Diagnostics only (checks/phase2 variant B): the first Phase 2 ProRAW path (Bayer anchor formula; see `proRAWCeiling`).
+    nonisolated(unsafe) static var legacyProRAW = false
+    /// EXPERIMENTAL, diagnostics only (research/11c §2.6, 12 §5): run the whole look on linear Display P3 numbers with P3 luma
+    /// weights, so its clamps sit at the P3 gamut instead of sRGB. Off in the app.
+    nonisolated(unsafe) static var workingP3 = false
+    /// Luminance weights of the working primaries (Rec.709/sRGB, or Display P3 when `workingP3`).
+    static var lumaWeights: (Double, Double, Double) { workingP3 ? (0.2289746, 0.6917385, 0.0792869) : (0.2126, 0.7152, 0.0722) }
+    static let sRGBToP3: [[Double]] = [[0.822462, 0.177538, 0], [0.033194, 0.966806, 0], [0.017083, 0.072397, 0.910520]]
+    static let p3ToSRGB: [[Double]] = [[1.224940, -0.224940, 0], [-0.042057, 1.042057, 0], [-0.019638, -0.078636, 1.098274]]
+    /// Working-space linear RGB ↔ linear sRGB (identity unless `workingP3`). Used by the OkLab print transform.
+    static func workingToSRGB(_ r: Double, _ g: Double, _ b: Double) -> (Double, Double, Double) {
+        guard workingP3 else { return (r, g, b) }
+        let m = p3ToSRGB
+        return (m[0][0] * r + m[0][1] * g + m[0][2] * b, m[1][0] * r + m[1][1] * g + m[1][2] * b, m[2][0] * r + m[2][1] * g + m[2][2] * b)
+    }
+    static func sRGBToWorking(_ c: (Double, Double, Double)) -> (Double, Double, Double) {
+        guard workingP3 else { return c }
+        let m = sRGBToP3, (r, g, b) = c
+        return (m[0][0] * r + m[0][1] * g + m[0][2] * b, m[1][0] * r + m[1][1] * g + m[1][2] * b, m[2][0] * r + m[2][1] * g + m[2][2] * b)
+    }
+    static func transformed(_ img: CIImage, _ m: [[Double]]) -> CIImage {
+        img.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: m[0][0], y: m[0][1], z: m[0][2], w: 0),
+            "inputGVector": CIVector(x: m[1][0], y: m[1][1], z: m[1][2], w: 0),
+            "inputBVector": CIVector(x: m[2][0], y: m[2][1], z: m[2][2], w: 0),
+        ])
+    }
 
     /// CIImage property: the decoded image's clip level (scene-linear) = where the tone curve puts display white.
     static let clipKey = "bettercam.clip"
-    /// Sensor clip of an iPhone Bayer DNG decoded at baselineExposure 0 (highlight recovery on). Measured 1.92–2.42
-    /// on the 17 Pro samples (research/10-phase1-pipeline.md). Erring high costs nothing: the shoulder is flat there.
+    /// CIImage property: scene brightness EV100 from the file's EXIF (Phase 3B light-mood gate), when present.
+    static let evKey = "bettercam.ev"
+
+    /// EV100 = log2(N²/t) − log2(ISO/100): how bright the scene really was. Tungsten interiors ≈ 5–8, daylight ≈ 12–15.
+    static func sceneEV(_ url: URL) -> Double? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any],
+              let x = p[kCGImagePropertyExifDictionary as String] as? [String: Any],
+              let n = x[kCGImagePropertyExifFNumber as String] as? Double, let t = x[kCGImagePropertyExifExposureTime as String] as? Double,
+              let iso = (x[kCGImagePropertyExifISOSpeedRatings as String] as? [Double])?.first, n > 0, t > 0, iso > 0 else { return nil }
+        return log2(n * n / t) - log2(iso / 100)
+    }
+    /// Fallback only, for DNGs without AsShotNeutral. See `neutralClip`.
     static let sensorClip = 2.4
+
+    /// Where a neutral highlight clips in the decode at baselineExposure 0: max/min of the DNG's AsShotNeutral
+    /// (= 1/min(R, B) with green = 1). Highlight recovery rebuilds neutrals until the channel with the largest
+    /// white-balance gain saturates. Measured within 0.6% on 11 sensor-clipped 17 Pro Bayer DNGs, main and tele,
+    /// clips 1.90–3.00 (research/11-phase2-capture.md). ProRAW: same DNG math (WhiteLevel ÷ neutral), but only
+    /// verified by checks/phase2 once ProRAW samples exist.
+    static func neutralClip(_ url: URL) -> Double {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any],
+              let n = (p[kCGImagePropertyDNGDictionary as String] as? [String: Any])?["AsShotNeutral"] as? [Double],
+              n.count == 3, let lo = n.min(), lo > 0 else { return sensorClip }
+        return n.max()! / lo
+    }
+
+    /// Neutral ceiling of an Apple ProRAW decode at baselineExposure 0, EDR ≥ 2 (research/11b-proraw-validation.md).
+    /// Measured 2.500 on 6 iPhone 17 Pro ProRAWs, 12 and 48 MP (2.489 on one), independent of AnalogBalance; EDR 2 ≡ 4 ≡ 8.
+    /// It's the largest neutral the file can represent, touched by ≤ 0.04% of pixels: not a Bayer-style clip plateau
+    /// (fusion keeps lamps below it). The Bayer formula can't apply: ProRAW's AsShotNeutral is [1, 1, 1] (white balance
+    /// is baked in through AnalogBalance), so it gave 1.0 and clamped the top 1.3 stops (up to 0.9% of the frame) to white.
+    static let proRAWCeiling = 2.5
+
+    /// ProRAW only: Apple's net mid-tone exposure minus BaselineExposure, in stops. Goes into `Recipe.baseExposure` once
+    /// per photo (Library), not into decode: it costs two decodes (~3 s for 48 MP on a Mac).
+    /// Why: Apple splits a ProRAW's exposure between BaselineExposure and the ProfileGainTableMap. We drop the map
+    /// (localToneMapAmount 0: it's Apple's local tone mapping), but it also carries a large *global* gain, so BaselineExposure
+    /// alone is no consistent exposure: measured 0.26–1.89 stops short of Apple's own, and 12 MP vs 48 MP of the same scene
+    /// ended 1.55 stops apart. This takes Apple's net gain at the median pixel (BE + map, no tone curve, no boost) as one
+    /// global exposure: Apple's metering decision, not its curve, local contrast or color. 12/48 MP pairs then agree within 0.4 stop.
+    static func proRAWExposure(_ url: URL) -> Double {
+        func greens(apple: Bool) -> [Float] {
+            guard let r = CIRAWFilter(imageURL: url) else { return [] }
+            r.scaleFactor = Float(min(1, 256 / max(r.nativeSize.width, r.nativeSize.height)))
+            r.boostAmount = 0; r.boostShadowAmount = 0; r.shadowBias = 0; r.isGamutMappingEnabled = false
+            r.extendedDynamicRangeAmount = 2
+            r.localToneMapAmount = apple ? 1 : 0
+            if !apple { r.baselineExposure = 0 }
+            guard let img = r.outputImage else { return [] }
+            let e = img.extent.integral, w = Int(e.width), h = Int(e.height)
+            var p = [Float](repeating: 0, count: w * h * 4)
+            context.render(img, toBitmap: &p, rowBytes: w * 16, bounds: e, format: .RGBAf, colorSpace: context.workingColorSpace)
+            return stride(from: 1, to: p.count, by: 4).map { p[$0] }
+        }
+        let a = greens(apple: true), l = greens(apple: false)
+        var lr: [Double] = []
+        for (x, y) in zip(a, l) where y > 0.002 && x > 0 { lr.append(log2(Double(x / y))) }
+        guard !lr.isEmpty, let be = CIRAWFilter(imageURL: url)?.baselineExposure else { return 0 }
+        lr.sort()
+        return lr[lr.count / 2] - Double(be)
+    }
+
+    /// The exposure a new photo's recipe starts from (`Recipe.baseExposure`): decode restores a fixed `rawCompensation`,
+    /// so this carries what the camera actually did (EXIF bias; imports: the photographer's bias is kept, net 0),
+    /// plus the ProRAW correction above.
+    static func startingExposure(_ url: URL, captured: Bool) -> Double {
+        guard url.pathExtension.lowercased() == "dng" else { return 0 }
+        var e = -rawCompensation
+        if captured, let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any],
+           let bias = (p[kCGImagePropertyExifDictionary as String] as? [String: Any])?[kCGImagePropertyExifExposureBiasValue as String] as? Double {
+            e = -(bias + rawCompensation)
+        }
+        return isProRAW(url) ? e + proRAWExposure(url) : e
+    }
+
+    /// ProRAW is a demosaiced LinearRaw DNG; Bayer carries a CFA pattern.
+    static func isProRAW(_ url: URL) -> Bool {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any],
+              let dng = p[kCGImagePropertyDNGDictionary as String] as? [String: Any] else { return false }
+        return dng["CFAPlaneColor"] == nil
+    }
 
     /// Scene-linear decode, center-cropped by `crop`.
     /// RAW: Apple's tone curve, local tone mapping (HDR flattening) and sharpening are all off. What's left is
     /// demosaic + the sensor's color matrix + light noise reduction, which any RAW developer has to do.
     /// Measured on the 17 Pro (research/10-phase1-pipeline.md): with EDR 0 Core Image rolls off above ~0.6 and clips
-    /// at 1.0; with baseline exposure applied inside the filter EDR 1 still caps at 3.0. So decode at EDR 1 with
-    /// baseline 0 and exposure 0 (exactly linear up to the sensor clip ≈ 2.4), then apply baseline + our −1 EV capture
-    /// compensation as a plain float gain, where nothing can clip.
+    /// at 1.0; with baseline exposure applied inside the filter EDR 1 still caps at 3.0. So decode at EDR 2 with
+    /// baseline 0 and exposure 0 (EDR 1 soft-compresses the last ~0.05 below 3.0; EDR 2 ≡ EDR 4 bit for bit, measured),
+    /// then apply the gain as a plain float multiply, where nothing can clip.
+    /// Two separate things are in that gain:
+    /// - BaselineExposure: Apple's per-file *rendering* offset (0–1.36 stops measured; larger on tele). It says how bright
+    ///   the camera maker wants the linear data shown. It is not light we withheld and not recoverable sensor exposure.
+    /// - `rawCompensation`: undoes the −1 EV capture bias. Captures whose actual EXIF bias differs (−0.70 seen; bias 0 in
+    ///   diagnostic modes B–D) carry the difference in `Recipe.baseExposure` (Library.add), so old recipes keep rendering the same.
+    /// ProRAW (Apple's linear recipe, WWDC21 10160): boost 0 removes its default tone curve, localToneMapAmount 0 its
+    /// gain-table local tone map, baselineExposure 0 its brightness offset. What's left is Apple's fused, demosaiced,
+    /// scene-referred linear data in the DNG's own color profile.
     static func decode(_ url: URL, crop: Double = 1, maxSide: CGFloat? = nil) -> CIImage? {
         var img: CIImage?
         var clip = 1.0 // display-referred input (HEIC): already tone-mapped to SDR white
@@ -115,6 +230,11 @@ enum Look {
             raw.boostShadowAmount = 0
             raw.localToneMapAmount = 0
             raw.sharpnessAmount *= 0.6 // mild, like a good camera; Apple's full amount halos
+            let proRAW = isProRAW(url)
+            if proRAW { // rest of Apple's linear ProRAW recipe (WWDC21 10160). Bayer: both measured as no-ops (Phase 1)
+                raw.shadowBias = 0
+                raw.isGamutMappingEnabled = false
+            }
             if legacyDecode {
                 raw.exposure = Float(rawCompensation)
                 img = raw.outputImage
@@ -122,9 +242,9 @@ enum Look {
             } else {
                 let gain = pow(2, Double(raw.baselineExposure) + rawCompensation) // per file: 0.005–1.36 stops measured
                 raw.baselineExposure = 0
-                raw.extendedDynamicRangeAmount = 1
+                raw.extendedDynamicRangeAmount = 2
                 img = raw.outputImage.map { scaled($0, gain) }
-                clip = sensorClip * gain
+                clip = (proRAW && !legacyProRAW ? proRAWCeiling : neutralClip(url)) * gain
             }
         } else { // processed HEIC fallback (cameras without RAW)
             img = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]).map { im in
@@ -140,7 +260,9 @@ enum Look {
             img = img.cropped(to: CGRect(x: e.midX - w / 2, y: e.midY - h / 2, width: w, height: h))
                 .transformed(by: CGAffineTransform(translationX: -(e.midX - w / 2), y: -(e.midY - h / 2)))
         }
-        return img.settingProperties([clipKey: clip])
+        var props: [String: Any] = [clipKey: clip]
+        props[evKey] = sceneEV(url)
+        return img.settingProperties(props)
     }
 
     static func scaled(_ img: CIImage, _ k: Double) -> CIImage {
@@ -177,6 +299,137 @@ enum Look {
         var subjectMask: CIImage? = nil   // Vision person mask (stills only), any size; scaled at apply time
         var subjectGap = 0.0              // stops the subject sits below the background; 0 unless trusted (subjectGap())
         var clip = 1.0                    // scene-linear level the source clips at (decode's `clipKey`); 1 = SDR input
+        // Phase 3B
+        var illuminant = (T: 0.0, G: 0.0, confidence: 0.0) // residual cast left by as-shot WB (log units, see wbGains)
+        var faces: [CGRect] = []          // Vision face boxes, normalized, origin bottom-left (same as Core Image)
+        var maskTrusted = false           // person mask passed subjectGap's coverage/decisiveness test
+        var faceGap = 0.0                 // stops the face sits below the background (negative: brighter)
+        var sceneEV: Double? = nil        // EXIF scene brightness (EV100), nil for files without it
+    }
+
+    /// Scene light, as an interpretable label for reports and debugging. Every rendering decision uses the continuous
+    /// T/G/confidence numbers instead, so nothing jumps between adjacent viewfinder frames.
+    static func lightMood(_ a: Analysis, meanY: Double? = nil) -> String {
+        let (T, G, c) = a.illuminant
+        if c < 0.3 { return "colored/mixed light (low confidence: left as shot)" }
+        let ev = a.sceneEV.map { String(format: " EV %.1f", $0) } ?? " no EXIF"
+        if T > 0.12, let e = a.sceneEV, e > 10.5 { return "warm but bright\(ev): golden hour or warm materials (kept)" }
+        if T > 0.35 { return "tungsten / warm bulb\(ev)" }
+        if T > 0.12 { return "warm interior light\(ev)" }
+        if T < -0.1 { return "cool (shade/overcast)" }
+        return abs(G) > 0.08 ? "neutral, tinted (fluorescent/LED)" : "neutral"
+    }
+
+    /// Selective (local) finishing plan for one photo: masks plus the measured EV moves. nil = global-only fallback
+    /// (no person, untrusted mask, viewfinder, or a look without local controls).
+    struct Selective { let person: CIImage; let face: CIImage?; let lift: Double; let background: Double; var skin: CIImage? = nil }
+
+    /// Masks refined to the full image: Vision's 512 px mask is upsampled by CIEdgePreserveUpsampleFilter, guided by the
+    /// photo's own edges, so hair and straps follow the picture rather than a blurry blob; then lightly feathered.
+    static func selectivePlan(_ gr: Grade, _ a: Analysis, guide: CIImage) -> Selective? {
+        guard gr.faceLift > 0 || gr.backgroundTone > 0 || gr.skinChromaLocal != 1, a.maskTrusted, let m = a.subjectMask else { return nil }
+        let e = guide.extent
+        let grey = CIVector(x: 1, y: 0, z: 0, w: 0) // Vision's one-component mask → the same value in R, G and B
+        let small = m.applyingFilter("CIColorMatrix", parameters: ["inputRVector": grey, "inputGVector": grey, "inputBVector": grey])
+        let g = guide.applyingFilter("CIColorClamp", parameters: ["inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
+            .transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+        let refined = g.applyingFilter("CIEdgePreserveUpsampleFilter", parameters: [
+            "inputSmallImage": small, "inputSpatialSigma": 3, "inputLumaSigma": 0.15,
+        ])
+        .transformed(by: CGAffineTransform(translationX: e.minX, y: e.minY))
+        .clampedToExtent().applyingGaussianBlur(sigma: max(e.width, e.height) * 0.0012)
+        .applyingFilter("CIColorClamp", parameters: ["inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 1), "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
+        .cropped(to: e)
+        // face: soft ellipse per detected face (box grown to forehead/jaw), only where the person mask agrees
+        var face: CIImage?
+        for f in a.faces {
+            let w = f.width * e.width, h = f.height * e.height * 1.25
+            let cx = e.minX + f.midX * e.width, cy = e.minY + (f.midY + f.height * 0.05) * e.height
+            let disc = CIFilter(name: "CIRadialGradient", parameters: [
+                "inputCenter": CIVector(x: 0, y: 0), "inputRadius0": 0.55, "inputRadius1": 1.0,
+                "inputColor0": CIColor.white, "inputColor1": CIColor.black,
+            ])!.outputImage!
+            let ellipse = disc.transformed(by: CGAffineTransform(scaleX: w * 0.62, y: h * 0.62).concatenating(CGAffineTransform(translationX: cx, y: cy)))
+                .cropped(to: e)
+            face = face.map { ellipse.applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: $0]) } ?? ellipse
+        }
+        face = face?.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: refined]).cropped(to: e)
+        // measured, bounded moves: a face darker than its surroundings gets up to `faceLift`; a face already brighter gets none
+        let lift = face == nil ? 0 : min(gr.faceLift, max(0, 0.15 + 0.5 * a.faceGap))
+        let bg = min(gr.backgroundTone, max(0, 0.5 * a.subjectGap + (a.faceGap > 0 ? 0.5 * a.faceGap : 0)))
+        let skin = gr.skinRegion ? face.flatMap { skinRegion(guide: g, faces: a.faces, person: refined, face: $0, extent: e) } : nil
+        return Selective(person: refined, face: face, lift: lift, background: bg, skin: skin)
+    }
+
+    /// Phase 4: this person's exposed skin, not just the face ellipse. The face's own skin color (median OkLab of the inner face
+    /// box) defines the target, so every complexion is matched to itself rather than to one "skin" hue; a 3D LUT turns each
+    /// pixel's distance from it into a weight (tight in a/b, loose in L for shading), multiplied by the person mask so
+    /// a same-colored wall can't qualify, then unioned with the face ellipse. nil if no face color could be measured.
+    /// `guide` is the display-encoded photo at the origin (as in selectivePlan); returns a mask on extent `e`.
+    static func skinRegion(guide: CIImage, faces: [CGRect], person: CIImage, face: CIImage, extent e: CGRect) -> CIImage? {
+        let ge = guide.extent
+        var labs: [(Double, Double, Double)] = []
+        for f in faces { // inner face: cheeks/forehead/nose, avoiding hair, eyes-heavy edges and background
+            let box = CGRect(x: ge.minX + (f.minX + f.width * 0.25) * ge.width, y: ge.minY + (f.minY + f.height * 0.2) * ge.height,
+                             width: f.width * 0.5 * ge.width, height: f.height * 0.55 * ge.height).integral
+            guard box.width >= 4, box.height >= 4 else { continue }
+            let k = 24 / max(box.width, box.height)
+            let small = guide.cropped(to: box).transformed(by: CGAffineTransform(translationX: -box.minX, y: -box.minY))
+                .applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": k])
+            let se = small.extent.integral, w = Int(se.width), h = Int(se.height)
+            guard w > 0, h > 0 else { continue }
+            var px = [Float](repeating: 0, count: w * h * 4)
+            context.render(small, toBitmap: &px, rowBytes: w * 16, bounds: se, format: .RGBAf, colorSpace: nil)
+            for i in stride(from: 0, to: px.count, by: 4) {
+                let lab = OkLab.from((toLinear(Double(px[i])), toLinear(Double(px[i + 1])), toLinear(Double(px[i + 2]))))
+                if lab.0 > 0.25 && lab.0 < 0.95 && hypot(lab.1, lab.2) > 0.015 { labs.append(lab) } // not shadow/specular/grey
+            }
+        }
+        guard labs.count >= 12 else { return nil }
+        func med(_ v: [Double]) -> Double { v.sorted()[v.count / 2] }
+        let L0 = med(labs.map(\.0)), a0 = med(labs.map(\.1)), b0 = med(labs.map(\.2))
+        // ponytail: one color per photo (median of all faces); two people with very different skin get a looser match for both
+        let n = 25
+        var cube = [Float](repeating: 1, count: n * n * n * 4)
+        var i = 0
+        for b in 0..<n { for g in 0..<n { for r in 0..<n {
+            let lab = OkLab.from((toLinear(Double(r) / Double(n - 1)), toLinear(Double(g) / Double(n - 1)), toLinear(Double(b) / Double(n - 1))))
+            let dab = hypot(lab.1 - a0, lab.2 - b0), dL = lab.0 - L0
+            // full weight within 0.025 in a/b (≈ 2.5 ΔE) of the face, gone by 0.055; lightness may vary −0.3…+0.15 (shade vs lit)
+            let wC = 1 - Grade.smooth(0.025, 0.055, dab)
+            let wL = Grade.smooth(-0.32, -0.2, dL) * (1 - Grade.smooth(0.12, 0.22, dL))
+            let v = Float(wC * wL)
+            cube[i] = v; cube[i + 1] = v; cube[i + 2] = v
+            i += 4
+        }}}
+        let f = CIFilter.colorCube()
+        f.inputImage = guide; f.cubeDimension = Float(n)
+        f.cubeData = cube.withUnsafeBufferPointer { Data(buffer: $0) }
+        guard let w = f.outputImage else { return nil }
+        let skin = w.transformed(by: CGAffineTransform(translationX: e.minX - ge.minX, y: e.minY - ge.minY))
+            .clampedToExtent().applyingGaussianBlur(sigma: max(e.width, e.height) * 0.0015).cropped(to: e) // no pixel speckle
+            .applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: person])
+        return face.applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: skin]).cropped(to: e)
+    }
+
+    /// Scene-linear gain map from the plan: background × 2^−bg, face × 2^lift. Exposure only, so texture and the
+    /// face's own directional shadows keep their ratios; the tone curve then renders them like any other light.
+    static func gainMap(_ s: Selective, extent e: CGRect) -> CIImage {
+        let kb = pow(2, -s.background), kf = pow(2, s.lift) - 1
+        var gain = s.person.applyingFilter("CIColorMatrix", parameters: [ // kb + (1 − kb)·person
+            "inputRVector": CIVector(x: 1 - kb, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 1 - kb, y: 0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 1 - kb, y: 0, z: 0, w: 0), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBiasVector": CIVector(x: kb, y: kb, z: kb, w: 1),
+        ])
+        if let f = s.face, kf > 0 {
+            let fg = f.applyingFilter("CIColorMatrix", parameters: [ // 1 + kf·face
+                "inputRVector": CIVector(x: kf, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: kf, y: 0, z: 0, w: 0),
+                "inputBVector": CIVector(x: kf, y: 0, z: 0, w: 0), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBiasVector": CIVector(x: 1, y: 1, z: 1, w: 1),
+            ])
+            gain = fg.applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: gain])
+        }
+        return gain.cropped(to: e)
     }
 
     /// `grainSeed`: offset into the noise field. Stills use .zero (reproducible); the viewfinder varies it per frame.
@@ -184,12 +437,23 @@ enum Look {
         apply(r.grade, to: base, analysis: analysis, grainSeed: grainSeed)
     }
 
-    static func apply(_ gr: Grade, to base: CIImage, analysis: Analysis? = nil, grainSeed: CGPoint = .zero) -> CIImage {
-        let a = analysis ?? analyze(base, subject: true)
+    static func apply(_ gr: Grade, to source: CIImage, analysis: Analysis? = nil, grainSeed: CGPoint = .zero) -> CIImage {
+        let a = analysis ?? analyze(source, subject: true)
+        let gr = gr.resolved(sceneEV: a.sceneEV) // Phase 4 night deltas; identity for looks without them
+        let base = workingP3 ? transformed(source, sRGBToP3) : source
         // 1. exposure + white balance + AgX inset, as one linear matrix
         let g = pow(2, gr.exposure)
         let auto = [pow(a.wb.0, gr.autoWB), 1.0, pow(a.wb.2, gr.autoWB)]
-        let wb = [auto[0] * (1 + 0.2 * gr.temperature), auto[1] * (1 - 0.12 * gr.tint), auto[2] * (1 - 0.2 * gr.temperature)]
+        var wb = [auto[0] * (1 + 0.2 * gr.temperature), auto[1] * (1 - 0.12 * gr.tint), auto[2] * (1 - 0.2 * gr.temperature)]
+        // Phase 3B: bounded share of a *measured* residual cast, only warm side (cool light is left alone), confidence-gated
+        if gr.warmAdapt > 0 || gr.tintAdapt > 0 {
+            // a warm residual in a bright scene is warm *material* (brick, sand) or golden-hour light: leave it. Only dim,
+            // interior-level scenes (EV ≲ 9) count as artificial warm light. No EXIF: half weight.
+            let c = a.illuminant.confidence * (a.sceneEV.map { 1 - Grade.smooth(8.5, 10.5, $0) } ?? 0.5)
+            let T = min(max(a.illuminant.T, 0), 0.6) * c, G = min(max(a.illuminant.G, -0.2), 0.2) * c
+            let dr = -gr.warmAdapt * T - gr.tintAdapt * G, db = gr.warmAdapt * T - gr.tintAdapt * G
+            wb[0] *= exp(dr); wb[2] *= exp(db)
+        }
         func row(_ i: Int) -> CIVector {
             CIVector(x: inset[i][0] * g * wb[0], y: inset[i][1] * g * wb[1], z: inset[i][2] * g * wb[2], w: 0)
         }
@@ -216,6 +480,12 @@ enum Look {
                 kCIInputBackgroundImageKey: exposed, kCIInputMaskImageKey: mask,
             ])
         }
+        // 1c. Phase 3B selective pass (stills only: needs a trusted Vision mask), see selectivePlan()
+        let plan = selectivePlan(gr, a, guide: source.applyingFilter("CILinearToSRGBToneCurve"))
+        if let plan, plan.lift > 0.001 || plan.background > 0.001 {
+            exposed = gainMap(plan, extent: exposed.extent)
+                .applyingFilter("CIMultiplyCompositing", parameters: [kCIInputBackgroundImageKey: exposed]).cropped(to: exposed.extent)
+        }
         let shaped = exposed
             // into 0…1 for the LUT: clamp, normalize, cube-root shaper (keeps precision in the shadows)
             .applyingFilter("CIColorClamp", parameters: [
@@ -233,11 +503,24 @@ enum Look {
         cube.inputImage = shaped
         cube.cubeDimension = Float(lutSize)
         cube.cubeData = cachedLUT(gr, white: white)
+        var graded = cube.outputImage
+        // skin chroma on the face only: a second LUT (same grade, skin gate × skinChromaLocal) blended by the face mask
+        // (face ellipse ∩ person). Not the person mask: that includes clothing and hair, e.g. a mustard hoodie at skin hue.
+        // ponytail: necks/arms/hands outside the face ellipse get the global skin gate only; add a skin-colour region grow if that shows.
+        if let plan, let faceMask = plan.skin ?? plan.face, gr.skinChromaLocal != 1, let g0 = graded {
+            var gs = gr; gs.print.on = true; gs.print.skinChroma *= gr.skinChromaLocal
+            let c2 = CIFilter.colorCube()
+            c2.inputImage = shaped; c2.cubeDimension = Float(lutSize); c2.cubeData = cachedLUT(gs, white: white)
+            graded = c2.outputImage?.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: g0, kCIInputMaskImageKey: faceMask,
+            ]).cropped(to: g0.extent)
+        }
         // The cube holds display-encoded values: Core Image stores cube data at ~8-bit precision, which in linear light
         // posterizes the shadows (only a few levels below 1%). Encoded, the steps are perceptually even.
-        let display = cube.outputImage.map { microcontrast($0, amount: gr.microcontrast) }?
+        var display = graded.map { microcontrast($0, amount: gr.microcontrast) }?
             .applyingFilter("CISRGBToneCurveToLinear") ?? base
-        return grain(display, amount: gr.grain, seed: grainSeed).cropped(to: base.extent)
+        if workingP3 { display = transformed(display, p3ToSRGB) } // P3 numbers back to the working space Core Image expects
+        return grain(display, amount: gr.grain, seed: grainSeed).cropped(to: source.extent)
     }
 
     /// Reads a 96px copy on the CPU. The camera's as-shot WB is the prior; this corrects what it got wrong.
@@ -276,7 +559,16 @@ enum Look {
             guard (-0.25...0.85).contains(T), (-0.15...0.3).contains(G) else { continue }
             cands.append((T, G, y))
         }
-        var result = Analysis(wb: (1, 1, 1), clip: clip)
+        // White anchor = the photo's brightest real content, not the file's clip. A RAW's clip sits 1.2–2.3 stops above the
+        // viewfinder's video white (2^rawCompensation); anchoring there reserved shoulder for highlights most scenes don't have,
+        // so saved photos came out grey and flat next to the viewfinder. 99.5th percentile of the max channel (a lamp or
+        // specular can't move it), never below the viewfinder's white, never above the clip. Video/HEIC: unchanged.
+        var peaks = stride(from: 0, to: px.count, by: 4).map { Double(max(px[$0], px[$0 + 1], px[$0 + 2])) }
+        peaks.sort()
+        let p995 = peaks.isEmpty ? clip : peaks[min(peaks.count - 1, Int(0.995 * Double(peaks.count)))]
+        let floorWhite = min(clip, pow(2, rawCompensation))
+        var result = Analysis(wb: (1, 1, 1), clip: min(clip, max(floorWhite, p995)))
+        result.sceneEV = img.properties[evKey] as? Double
         if !cands.isEmpty {
             func median(_ v: [(Double, Double)]) -> Double { // weighted median of (value, weight)
                 let sorted = v.sorted { $0.0 < $1.0 }, half = sorted.reduce(0) { $0 + $1.1 } / 2
@@ -284,10 +576,13 @@ enum Look {
                 for (x, wt) in sorted { acc += wt; if acc >= half { return x } }
                 return sorted.last!.0
             }
-            result.wb = wbGains(T: median(cands.map { ($0.T, $0.w) }), G: median(cands.map { ($0.G, $0.w) }),
-                                coverage: Double(cands.count) / Double(w * h))
+            let T = median(cands.map { ($0.T, $0.w) }), G = median(cands.map { ($0.G, $0.w) })
+            let coverage = Double(cands.count) / Double(w * h)
+            result.wb = wbGains(T: T, G: G, coverage: coverage)
+            result.illuminant = (T, G, min(coverage / 0.08, 1)) // Phase 3B: residual cast after as-shot WB
         }
-        if subject, let mask = personMask(img) {
+        if subject, let (mask, faces) = personMask(img) {
+            result.faces = faces
             // subject vs background brightness, measured on the same 96px copy
             let m = mask.transformed(by: CGAffineTransform(scaleX: CGFloat(w) / mask.extent.width, y: CGFloat(h) / mask.extent.height))
             var mp = [Float](repeating: 0, count: w * h * 4)
@@ -303,12 +598,26 @@ enum Look {
             result.subjectMask = mask
             result.subjectGap = subjectGap(subjectY: sY / max(sW, 1e-9), backgroundY: bY / max(bW, 1e-9),
                                            coverage: sW / n, decisiveness: decisive / n)
+            result.maskTrusted = (0.03...0.8).contains(sW / n) && decisive / n >= 0.8
+            // face luminance (median of the face box) vs the background mean, in stops
+            var fy: [Double] = []
+            for f in faces {
+                let x0 = Int(f.minX * Double(w)), x1 = Int(f.maxX * Double(w)), y0 = Int(f.minY * Double(h)), y1 = Int(f.maxY * Double(h))
+                for yy in max(0, y0)..<min(h, max(y0 + 1, y1)) { for xx in max(0, x0)..<min(w, max(x0 + 1, x1)) {
+                    let i = ((h - 1 - yy) * w + xx) * 4 // bitmap rows are top-down; boxes are bottom-up
+                    fy.append(0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2]))
+                }}
+            }
+            if !fy.isEmpty, bW > 0 {
+                fy.sort()
+                result.faceGap = log2(max(bY / bW, 1e-6) / max(fy[fy.count / 2], 1e-6))
+            }
         }
         return result
     }
 
-    /// Vision person segmentation on a display-ish copy (Vision expects a rendered photo, not scene-linear light).
-    static func personMask(_ img: CIImage) -> CIImage? {
+    /// Vision person segmentation (+ face boxes) on a display-ish copy (Vision expects a rendered photo, not scene-linear light).
+    static func personMask(_ img: CIImage) -> (CIImage, [CGRect])? {
         let e = img.extent, s = 512 / max(e.width, e.height)
         let small = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
             .applyingFilter("CIColorClamp", parameters: ["inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)])
@@ -316,12 +625,16 @@ enum Look {
         guard let cg = context.createCGImage(small, from: small.extent, format: .RGBA8,
                                              colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!) else { return nil }
         let req = VNGeneratePersonSegmentationRequest()
-        req.qualityLevel = .balanced
+        req.qualityLevel = .balanced // unchanged: other looks' subjectLift uses this mask too; edges are refined at full size (selectivePlan)
         req.outputPixelFormat = kCVPixelFormatType_OneComponent8
-        guard (try? VNImageRequestHandler(cgImage: cg).perform([req])) != nil,
+        let faceReq = VNDetectFaceRectanglesRequest()
+        guard (try? VNImageRequestHandler(cgImage: cg).perform([req, faceReq])) != nil,
               let pb = req.results?.first?.pixelBuffer else { return nil }
         let mask = CIImage(cvPixelBuffer: pb)
-        return mask.transformed(by: CGAffineTransform(translationX: -mask.extent.minX, y: -mask.extent.minY))
+        // ponytail: faces smaller than ~2% × 2% of the frame are skipped (too small to lift safely, and false positives live there)
+        let faces = (faceReq.results ?? []).filter { $0.confidence > 0.6 && $0.boundingBox.width * $0.boundingBox.height > 0.0004 }
+            .map(\.boundingBox)
+        return (mask.transformed(by: CGAffineTransform(translationX: -mask.extent.minX, y: -mask.extent.minY)), faces)
     }
 
     /// How many stops darker a person is than their surroundings — 0 unless the mask is trustworthy:
@@ -358,7 +671,7 @@ enum Look {
     /// Slider drags and the live viewfinder re-render constantly; only rebuild the LUT when its inputs change.
     /// Built outside the lock so the viewfinder never waits behind an editor rebuild.
     static func cachedLUT(_ g: Grade, white: Double) -> Data {
-        let key = g.lutKey + String(format: ",w%.2f,%d", white, legacyCurve ? 1 : 0)
+        let key = g.lutKey + String(format: ",w%.2f,%d,%d", white, legacyCurve ? 1 : 0, workingP3 ? 1 : 0)
         if let d = lutLock.withLock({ lutCache[key] }) { return d }
         let d = lut(g, white: white)
         lutLock.withLock {
@@ -376,8 +689,9 @@ enum Look {
         func tone(_ v: Double) -> Double {
             let x = log2(max(v, 1e-9) / 0.18)
             return legacyCurve ? filmic(x, hi: whiteStops, k: gr.contrast)
-                : toEncoded(photographic(x, grey: grey, slope: slope, white: white))
+                : toEncoded(photographic(x, grey: grey, slope: slope, white: white, mid: gr.midContrast, toe: gr.toeWidth))
         }
+        let (kr, kg, kb) = lumaWeights
         var scene = [Double](repeating: 0, count: n), curve = scene
         for i in 0..<n {
             let x = Double(i) / Double(n - 1)
@@ -385,7 +699,7 @@ enum Look {
             curve[i] = tone(scene[i])
         }
         var out = [Float](repeating: 1, count: n * n * n * 4)
-        let sat = gr.saturation * chromaNorm, h = hueHold
+        let sat = gr.saturation * chromaNorm, h = gr.hueHold
         let o = outset
         let o00 = o[0][0], o01 = o[0][1], o02 = o[0][2], o10 = o[1][0], o11 = o[1][1], o12 = o[1][2]
         let o20 = o[2][0], o21 = o[2][1], o22 = o[2][2]
@@ -396,14 +710,14 @@ enum Look {
                 var cr = curve[r], cg = curve[g], cb = curve[b]
                 // hue-preserving blend: tone-map luminance once and keep the scene's channel ratios
                 let vr = scene[r], vg = scene[g], vb = scene[b]
-                let yS = 0.2126 * vr + 0.7152 * vg + 0.0722 * vb
+                let yS = kr * vr + kg * vg + kb * vb
                 if yS > 1e-9 {
                     let k = toLinear(tone(yS)) / yS
                     cr = (1 - h) * cr + h * toEncoded(vr * k)
                     cg = (1 - h) * cg + h * toEncoded(vg * k)
                     cb = (1 - h) * cb + h * toEncoded(vb * k)
                 }
-                let y = 0.2126 * cr + 0.7152 * cg + 0.0722 * cb
+                let y = kr * cr + kg * cg + kb * cb
                 cr = y + sat * (cr - y); cg = y + sat * (cg - y); cb = y + sat * (cb - y)
                 // outset, then hue/sat, density, split tone, black & white level (display-encoded, see apply())
                 let f = gr.finish(o00 * cr + o01 * cg + o02 * cb, o10 * cr + o11 * cg + o12 * cb, o20 * cr + o21 * cg + o22 * cb)
@@ -418,9 +732,14 @@ enum Look {
     /// Below grey a pure power (log-log slope `slope`): no black clamp, no lift, shadows keep their ratios.
     /// Above grey a shoulder that bends smoothly from `slope` to flat exactly at `white` (the clip), so clipped
     /// highlights reach display white without an edge. Grey placement and midtone slope don't depend on `white`.
-    static func photographic(_ x: Double, grey: Double, slope c: Double, white: Double) -> Double {
-        guard x > 0 else { return grey * pow(2, c * x) }
-        let zw = log2(1 / grey), p = max(1, c * white / zw), t = min(x / white, 1)
+    /// `mid` (Phase 3): extra slope at grey only. Below grey the log-log curve is c·x + mid·toe·tanh(x/toe): slope c + mid at
+    /// grey, easing back to c a few stops down, so deep shadows sit just mid·toe stops lower than the base curve instead of
+    /// being crushed by a steeper power (the old looks' 1.33–1.64). Above grey the shoulder starts from slope c + mid and
+    /// still flattens exactly at `white`. mid 0 = the previous curve, bit for bit.
+    static func photographic(_ x: Double, grey: Double, slope c: Double, white: Double, mid: Double = 0, toe: Double = 1.5) -> Double {
+        guard x > 0 else { return grey * pow(2, c * x + mid * toe * tanh(x / max(toe, 0.1))) }
+        let c2 = c + mid
+        let zw = log2(1 / grey), p = max(1, c2 * white / zw), t = min(x / white, 1)
         return grey * pow(2, zw * (1 - pow(1 - t, p)))
     }
 
@@ -553,5 +872,38 @@ enum Look {
 
     static func heif(_ img: CIImage) -> Data? {
         context.heifRepresentation(of: img, format: .RGBA8, colorSpace: outputSpace, options: [:])
+    }
+
+    // MARK: - Diagnostics (research/11-phase2-capture.md §1: device validation of the decode)
+
+    /// Process memory as Xcode's gauge shows it (phys_footprint), MB.
+    static func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var n = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(n)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &n) }
+        }
+        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+    }
+
+    /// Decoded linear stats: size, max-channel max/p99/p99.9, % at the white anchor, % negative (out of sRGB).
+    /// If iOS behaves like macOS, max > 1 on any shot with a bright window and the anchor % matches the scene's real clipping.
+    static func decodeReport(_ img: CIImage) -> String {
+        let e = img.extent.integral, w = Int(e.width), h = Int(e.height)
+        var p = [Float](repeating: 0, count: w * h * 4)
+        context.render(img, toBitmap: &p, rowBytes: w * 16, bounds: e, format: .RGBAf, colorSpace: context.workingColorSpace)
+        let clip = Float((img.properties[clipKey] as? Double) ?? 1)
+        var m = [Float](), atClip = 0, neg = 0
+        m.reserveCapacity(w * h)
+        for i in stride(from: 0, to: p.count, by: 4) {
+            m.append(max(p[i], p[i + 1], p[i + 2]))
+            if p[i + 1] >= 0.99 * clip { atClip += 1 }
+            if min(p[i], p[i + 1], p[i + 2]) < 0 { neg += 1 }
+        }
+        m.sort()
+        let n = Float(m.count)
+        func q(_ x: Float) -> Float { m[min(m.count - 1, Int(x * n))] }
+        return String(format: "%dx%d max %.2f p99 %.2f p99.9 %.2f anchor %.2f atAnchor %.3f%% neg %.1f%%",
+                      w, h, m.last ?? 0, q(0.99), q(0.999), clip, 100 * Float(atClip) / n, 100 * Float(neg) / n)
     }
 }
