@@ -21,22 +21,11 @@ struct Grade: Equatable {
     var density = 0.04        // strong colors get deeper, not neon (subtractive film dyes)
     var grain = 0.06
     var bloom = 0.02          // halation around bright lights
+    var microcontrast = 0.0   // luminance local contrast (doc §7.7: 0.01–0.04, never "clarity")
+    var subjectLift = 0.0     // max EV a dark, clearly segmented person is lifted (doc §7.6: ≤ 0.15; 0 = never)
 
-    /// The neutral baseline (strength 0): clean display transform, light and true.
+    /// The neutral baseline (the Natural look): clean display transform, light and true.
     static let natural = Grade()
-
-    private static let scalars: [WritableKeyPath<Grade, Double>] = [
-        \.exposure, \.contrast, \.blackLift, \.whitePoint, \.saturation, \.autoWB, \.temperature, \.tint,
-        \.warmSat, \.warmShift, \.greenSat, \.greenShift, \.blueSat, \.blueShift, \.density, \.grain, \.bloom,
-    ]
-
-    func mixed(with o: Grade, _ t: Double) -> Grade {
-        var g = self
-        for k in Grade.scalars { g[keyPath: k] = self[keyPath: k] + (o[keyPath: k] - self[keyPath: k]) * t }
-        g.shadowTint = zip(shadowTint, o.shadowTint).map { $0 + ($1 - $0) * t }
-        g.highlightTint = zip(highlightTint, o.highlightTint).map { $0 + ($1 - $0) * t }
-        return g
-    }
 
     /// Cache key for the 3D LUT: only what's baked into it. Exposure, WB, grain and bloom run outside the LUT,
     /// so dragging those sliders never rebuilds it.
@@ -101,15 +90,24 @@ struct Filter: Identifiable, Equatable {
     let name: String
     let grade: Grade
 
-    static func named(_ id: String) -> Filter { all.first { $0.id == id } ?? all[0] }
+    static func named(_ id: String) -> Filter { (all + retired + [naturalReference]).first { $0.id == id } ?? all[0] }
 
-    static let all: [Filter] = [natural, chroma, portra, eterna, cmbyn, dune, br2049, classicChrome, nostalgicNeg]
+    /// First = default for new photos and the camera. Editorial set (research/newFilters_11_18.md) leads, in its launch order.
+    /// Debug builds also list the Natural Reference, so it can be picked on the phone without shipping it.
+    #if DEBUG
+    static let all: [Filter] = [editorial, riviera, sunStudy, afterHours, alpine, chroma, natural, naturalReference]
+    #else
+    static let all: [Filter] = [editorial, riviera, sunStudy, afterHours, alpine, chroma, natural]
+    #endif
+    /// Out of the app but kept: photos already saved with them still render with their look.
+    static let retired: [Filter] = [portra, eterna, cmbyn, dune, br2049, classicChrome, nostalgicNeg]
 
     /// Builds a look from the research tables (§5.2 tone/texture, §5.3 hue sectors). Absolute values, not deltas.
     private static func look(_ id: String, _ name: String,
                              _ exposure: Double, _ contrast: Double, _ blackLift: Double, _ whitePoint: Double,
                              _ saturation: Double, _ density: Double, _ grain: Double, _ bloom: Double,
-                             temp: Double, warm: (Double, Double), green: (Double, Double), blue: (Double, Double)) -> Filter {
+                             temp: Double, warm: (Double, Double), green: (Double, Double), blue: (Double, Double),
+                             micro: Double = 0, lift: Double = 0) -> Filter {
         var g = Grade()
         g.exposure = exposure; g.contrast = contrast; g.blackLift = blackLift; g.whitePoint = whitePoint
         g.saturation = saturation; g.density = density; g.grain = grain; g.bloom = bloom
@@ -117,13 +115,52 @@ struct Filter: Identifiable, Equatable {
         (g.warmSat, g.warmShift) = warm
         (g.greenSat, g.greenShift) = green
         (g.blueSat, g.blueShift) = blue
+        g.microcontrast = micro; g.subjectLift = lift
         return Filter(id: id, name: name, grade: g)
     }
 
     /// The baseline on its own: should already look like a good camera with no look picked.
     static let natural = Filter(id: "natural", name: "Natural", grade: .natural)
 
-    // Launch looks (research §5.4 priority). Subject intent in comments.
+    /// Diagnostic reference (Phase 1, research/10-phase1-pipeline.md), not a creative look: correct development only.
+    /// Camera's as-shot white balance, colorimetric chroma, gentle photographic curve (midtone slope ≈ 1.1 vs the
+    /// looks' 1.3–1.6), no hue moves, density, split tone, levels, grain, bloom, unsharp or subject lift.
+    /// Creative looks are judged by whether they beat this.
+    static let naturalReference: Filter = {
+        var g = Grade()
+        g.exposure = 0.45; g.contrast = 0.55; g.blackLift = 0; g.whitePoint = 1
+        g.saturation = 1; g.autoWB = 0
+        g.warmSat = 1; g.greenSat = 1; g.greenShift = 0; g.blueSat = 1
+        g.density = 0; g.grain = 0; g.bloom = 0; g.microcontrast = 0; g.subjectLift = 0
+        return Filter(id: "naturalReference", name: "Reference", grade: g)
+    }()
+
+    // Editorial set (research/newFilters_11_18.md §5), tuned 2026-11-18 by eye against the user's 23 reference photos
+    // (the doc's own values were too close to tell apart). Still no tints: differences are tone, density and per-hue
+    // chroma, so whites stay white. Warm-sector boosts capped at +2% after "way too yellow" feedback (2026-11-18). micro/lift ranges from doc §7.6/7.7. All provisional: re-tune on real captures.
+
+    /// EDITORIAL (flagship): campaign finish. True-black voids (horse window, denim), crisp but not hard contrast,
+    /// clean whites, saturated accents kept (blue halter, navy puffer). Fails if denim goes foggy or snow grey.
+    static let editorial = look("editorial", "Editorial", 0.50, 0.76, 0.000, 0.993, 1.00, 0.055, 0.04, 0.012,
+                                temp: 0, warm: (1.00, 0), green: (0.97, 0), blue: (1.03, 0), micro: 0.02, lift: 0.15)
+    /// RIVIERA: coastal haze (rock at dusk, maroon dress, pool, underwater). Soft and airy, pale unclipped highlights,
+    /// slightly open shadows, quiet greens, turquoise water nudged a touch cyan. Not a faded vintage filter.
+    static let riviera = look("riviera", "Riviera", 0.68, 0.58, 0.015, 0.975, 0.92, 0.025, 0.12, 0.05,
+                              temp: 0, warm: (1.00, 0), green: (0.92, -1), blue: (1.02, 2), micro: 0.01, lift: 0.10)
+    /// SUN STUDY: hard sun (taped hand, bikini, white shirt by the lake). Dense sculpted shadows, deep blue water/sky,
+    /// skin bronzed by light. White shirts stay white because there's no tint, only warm-sector chroma.
+    static let sunStudy = look("sunStudy", "Sun Study", 0.48, 0.82, 0.000, 0.991, 1.04, 0.070, 0.08, 0.020,
+                               temp: 0, warm: (1.00, -1), green: (0.95, -1), blue: (1.08, 0), micro: 0.03, lift: 0.05)
+    /// AFTER HOURS: night/flash fashion (red door, mascara, store, gold dresses). Darkest, punchiest look; red and gold
+    /// stay rich (WB backs off when nothing neutral is lit); visible grain. Never lifts faces.
+    static let afterHours = look("afterHours", "After Hours", 0.38, 0.82, 0.000, 0.994, 1.02, 0.060, 0.22, 0.040,
+                                 temp: 0, warm: (1.02, 0), green: (0.97, 0), blue: (0.99, 0), micro: 0.015, lift: 0)
+    /// ALPINE: tents glowing against snow and deep navy sky. Crisp contrast, vivid yellow/orange, near-neutral snow
+    /// (open-shade blue partly kept by WB), dark night stays dark.
+    static let alpine = look("alpine", "Alpine", 0.42, 0.78, 0.000, 0.992, 1.05, 0.050, 0.06, 0.006,
+                             temp: 0, warm: (1.02, 0), green: (0.98, 0), blue: (1.06, 0), micro: 0.03, lift: 0.10)
+
+    // Earlier looks (research/rawCameraResearch.md §5.4). Subject intent in comments.
     /// Chromagraph-inspired: skin gently warmer, not orange; soft bright transitions; quieter greens/blues.
     static let chroma = look("chroma", "Chroma", 0.48, 0.71, 0.003, 0.987, 0.96, 0.050, 0.12, 0.10,
                              temp: 0.012, warm: (1.02, -1), green: (0.93, -1), blue: (0.93, 0))

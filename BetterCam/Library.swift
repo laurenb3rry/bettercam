@@ -18,8 +18,8 @@ final class Library: ObservableObject {
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         reload()
         // The look changed since these thumbnails were made: re-render them in the background.
-        if UserDefaults.standard.integer(forKey: "lookVersion") != Recipe.current {
-            UserDefaults.standard.set(Recipe.current, forKey: "lookVersion")
+        if UserDefaults.standard.integer(forKey: "lookVersion") != Look.version {
+            UserDefaults.standard.set(Look.version, forKey: "lookVersion")
             Task {
                 for shot in shots { await renderThumb(shot.id, recipe(shot.id)) }
                 reload()
@@ -55,7 +55,7 @@ final class Library: ObservableObject {
         guard ok else { return }
         var r = Recipe()
         // ponytail: imported RAWs weren't shot 1 stop under like ours; undo the decode's compensation
-        if isRaw { r.exposure = -Look.rawCompensation }
+        if isRaw { r.baseExposure = -Look.rawCompensation }
         try? JSONEncoder().encode(r).write(to: recipeURL(id))
         await renderThumb(id, r)
         reload()

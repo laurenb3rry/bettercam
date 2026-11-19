@@ -7,6 +7,8 @@ struct CameraView: View {
     @AppStorage("cameraFilter") private var filterID = Filter.all[0].id
     @State private var showGallery = false
     @State private var showName = false
+    @State private var flash = false
+    @AppStorage("grid") private var grid = false
 
     var body: some View {
         VStack(spacing: 20) {
@@ -21,7 +23,17 @@ struct CameraView: View {
                     let next = g.translation.width < 0 ? min(i + 1, all.count - 1) : max(i - 1, 0)
                     if next != i { filterID = all[next].id }
                 })
+                .overlay { if grid { ThirdsGrid() } }
                 .overlay(alignment: .top) { filterBadge }
+                .overlay(alignment: .topLeading) {
+                    HStack(spacing: 8) {
+                        if camera.flashAvailable {
+                            toggle(flash ? "bolt.fill" : "bolt.slash", on: flash) { flash.toggle() }
+                        }
+                        toggle("grid", on: grid) { grid.toggle() }
+                    }
+                    .padding(10)
+                }
 
             HStack(spacing: 12) {
                 if camera.current?.isFront != true {
@@ -45,7 +57,7 @@ struct CameraView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 Spacer()
-                Button { camera.capture() } label: {
+                Button { camera.capture(flash: flash && camera.flashAvailable) } label: {
                     Circle().fill(.white).frame(width: 66, height: 66)
                         .padding(5).overlay(Circle().stroke(.white, lineWidth: 3))
                         .opacity(camera.busy ? 0.4 : 1)
@@ -90,6 +102,16 @@ struct CameraView: View {
 }
 
 extension CameraView {
+    private func toggle(_ symbol: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(on ? Color.accentColor : .white)
+                .frame(width: 34, height: 34)
+                .background(.black.opacity(0.35), in: Circle())
+        }
+    }
+
     /// Film name flashes when you swipe; the dots always show where you are in the set.
     private var filterBadge: some View {
         VStack(spacing: 6) {
@@ -105,6 +127,23 @@ extension CameraView {
             }
         }
         .padding(.top, 14)
+        .allowsHitTesting(false)
+    }
+}
+
+/// Rule-of-thirds guide (doc §9: framing changes a photo more than another 3% saturation).
+struct ThirdsGrid: View {
+    var body: some View {
+        GeometryReader { g in
+            Path { p in
+                for i in 1...2 {
+                    let x = g.size.width * CGFloat(i) / 3, y = g.size.height * CGFloat(i) / 3
+                    p.move(to: CGPoint(x: x, y: 0)); p.addLine(to: CGPoint(x: x, y: g.size.height))
+                    p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: g.size.width, y: y))
+                }
+            }
+            .stroke(.white.opacity(0.35), lineWidth: 0.5)
+        }
         .allowsHitTesting(false)
     }
 }

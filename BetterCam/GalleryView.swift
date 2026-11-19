@@ -71,7 +71,7 @@ struct PhotoView: View {
     @State private var confirmDelete = false
     @State private var rendering = false
 
-    enum Tool: String, CaseIterable { case film = "Film", tone = "Tone", color = "Color", texture = "Texture" }
+    enum Tool: String, CaseIterable { case film = "Look", tone = "Tone", color = "Color" }
     @State private var previews: [String: UIImage] = [:]
 
     var body: some View {
@@ -85,16 +85,12 @@ struct PhotoView: View {
                 switch tool {
                 case .film:
                     filterStrip
-                    slider("Strength", $recipe.strength, 0...1)
                 case .tone:
-                    slider("Exposure", $recipe.exposure, -2...2)
-                    slider("Contrast", $recipe.contrast, 0...2)
+                    slider("Exposure", $recipe.exposure, Recipe.exposureRange)
+                    slider("Contrast", $recipe.contrast, Recipe.contrastRange)
                 case .color:
-                    slider("Warmth", $recipe.warmth, -1...1)
-                    slider("Saturation", $recipe.saturation, 0...2)
-                case .texture:
-                    slider("Bloom", $recipe.bloom, 0...1)
-                    slider("Grain", $recipe.grain, 0...1)
+                    slider("Warmth", $recipe.warmth, Recipe.warmthRange)
+                    slider("Saturation", $recipe.saturation, Recipe.saturationRange)
                 }
             }
             .frame(height: 150, alignment: .top)
@@ -117,7 +113,7 @@ struct PhotoView: View {
                     ShareLink(item: library.raw(id)) {
                         Label(library.raw(id).pathExtension == "dng" ? "Share RAW (DNG)" : "Share original", systemImage: "doc")
                     }
-                    Button("Reset edits") { recipe = Recipe(filter: recipe.filter, crop: recipe.crop) }
+                    Button("Reset edits") { recipe.resetSliders() }
                 } label: { Image(systemName: "ellipsis.circle") }
             }
             ToolbarItem(placement: .topBarTrailing) {
@@ -142,7 +138,7 @@ struct PhotoView: View {
             let url = library.raw(id), crop = recipe.crop
             let loaded = await Task.detached(priority: .userInitiated) { () -> (CIImage, Look.Analysis)? in
                 guard let b = Look.decode(url, crop: crop, maxSide: 1600).flatMap(Look.materialize) else { return nil }
-                return (b, Look.analyze(b))
+                return (b, Look.analyze(b, subject: true))
             }.value
             base = loaded?.0
             analysis = loaded?.1
@@ -176,7 +172,7 @@ struct PhotoView: View {
                 ForEach(Filter.all) { f in
                     let on = recipe.filter == f.id
                     Button {
-                        if !on { recipe.filter = f.id; recipe.strength = 1 }
+                        if !on { recipe.filter = f.id }
                     } label: {
                         VStack(spacing: 4) {
                             Group {
@@ -196,12 +192,16 @@ struct PhotoView: View {
 
     private func renderPreviews() async {
         guard let base, let analysis else { return }
-        let crop = recipe.crop
+        let crop = recipe.crop, base0 = recipe.baseExposure
         previews = await Task.detached(priority: .utility) {
             let s = 160 / max(base.extent.width, base.extent.height)
             let small = base.transformed(by: CGAffineTransform(scaleX: s, y: s))
             var out: [String: UIImage] = [:]
-            for f in Filter.all { out[f.id] = Look.uiImage(Look.apply(Recipe(filter: f.id, crop: crop), to: small, analysis: analysis)) }
+            for f in Filter.all {
+                var r = Recipe(filter: f.id, crop: crop)
+                r.baseExposure = base0
+                out[f.id] = Look.uiImage(Look.apply(r, to: small, analysis: analysis))
+            }
             return out
         }.value
     }
@@ -225,7 +225,9 @@ struct PhotoView: View {
         defer { exporting = false }
         let r = recipe, url = library.raw(id)
         let data = await Task.detached(priority: .userInitiated) {
-            Look.decode(url, crop: r.crop).flatMap { Look.jpeg(Look.apply(r, to: $0), quality: 0.95) }
+            Look.decode(url, crop: r.crop).flatMap {
+                Look.jpeg(Look.apply(r, to: $0).settingProperties(Look.exportProperties(source: url, recipe: r)), quality: 0.95)
+            }
         }.value
         guard let data else { message = "Couldn't render this photo."; return }
 

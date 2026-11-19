@@ -1,4 +1,5 @@
 import AVFoundation
+import os
 import SwiftUI
 
 /// RAW capture: Bayer RAW where the camera has it (no Apple processing), ProRAW otherwise (selfie camera).
@@ -22,6 +23,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     @Published private(set) var front: Stop?
     @Published private(set) var current: Stop?
     @Published private(set) var busy = false
+    @Published private(set) var flashAvailable = false
     @Published var error: String?
     var onCapture: ((Shot) -> Void)?
     /// Filtered viewfinder frames (called on the video queue).
@@ -70,7 +72,8 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         }
     }
 
-    func capture() {
+    /// `flash`: the LED, for After Hours-style shots (doc §5.3: flash is a capture feature, not a look).
+    func capture(flash: Bool = false) {
         queue.async {
             guard let stop = self.current else { return }
             let settings: AVCapturePhotoSettings
@@ -82,6 +85,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
                 settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
                 settings.photoQualityPrioritization = .balanced
             }
+            if flash, self.output.supportedFlashModes.contains(.on) { settings.flashMode = .on }
             if let conn = self.output.connection(with: .video) {
                 if let angle = self.rotation?.videoRotationAngleForHorizonLevelCapture, conn.isVideoRotationAngleSupported(angle) {
                     conn.videoRotationAngle = angle
@@ -172,12 +176,15 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             }
             rotation = AVCaptureDevice.RotationCoordinator(device: d, previewLayer: nil)
         }
-        DispatchQueue.main.async { self.current = stop }
+        let flash = output.supportedFlashModes.contains(.on)
+        DispatchQueue.main.async { self.current = stop; self.flashAvailable = flash }
     }
 
     private func fail(_ message: String) {
         DispatchQueue.main.async { self.error = message; self.busy = false }
     }
+
+    private static let log = Logger(subsystem: "bettercam", category: "capture")
 
     private static func zoom(_ d: AVCaptureDevice, relativeTo wide: AVCaptureDevice) -> Double {
         func halfTan(_ x: AVCaptureDevice) -> Double { tan(Double(x.activeFormat.videoFieldOfView) * .pi / 360) }
@@ -190,6 +197,13 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         guard error == nil, let data = photo.fileDataRepresentation() else {
             return fail(error?.localizedDescription ?? "Capture failed.")
         }
+        // what the sensor actually delivered (doc P0: verify Bayer size per lens; a 2x crop of ~12MP is ~3MP real pixels)
+        let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any]
+        let dims = photo.isRawPhoto ? photo.resolvedSettings.rawPhotoDimensions : photo.resolvedSettings.photoDimensions
+        let mp = Double(dims.width) * Double(dims.height) / (pendingCrop * pendingCrop) / 1e6
+        let iso = String(describing: exif?[kCGImagePropertyExifISOSpeedRatings as String] ?? "?")
+        let shutter = String(describing: exif?[kCGImagePropertyExifExposureTime as String] ?? "?")
+        Self.log.info("capture \(self.current?.label ?? "?", privacy: .public) raw=\(photo.isRawPhoto) \(dims.width)x\(dims.height) crop=\(self.pendingCrop) -> \(String(format: "%.1f", mp), privacy: .public)MP ISO=\(iso, privacy: .public) t=\(shutter, privacy: .public) flash=\(photo.resolvedSettings.isFlashEnabled)")
         onCapture?(Shot(data: data, ext: photo.isRawPhoto ? "dng" : "heic", crop: pendingCrop, filter: pendingFilter))
     }
 
@@ -207,6 +221,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         img = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
             // frames are underexposed by the RAW bias, like the DNG before decode: restore the same way
             .applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: Look.rawCompensation])
+            .settingProperties([Look.clipKey: pow(2, Look.rawCompensation)]) // 8-bit video white, after that gain
         frameCount += 1
         if analysis == nil || frameCount % 15 == 0 { analysis = Look.analyze(img) } // white point + WB, ~2×/s
         let seed = CGPoint(x: .random(in: 0..<4096), y: .random(in: 0..<4096)) // grain must not sit still on screen

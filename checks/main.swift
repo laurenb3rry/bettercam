@@ -9,7 +9,7 @@ var failed = false
 func check(_ ok: Bool, _ msg: String) { print(ok ? "ok  " : "FAIL", msg); if !ok { failed = true } }
 
 var clean = Grade.natural; clean.grain = 0; clean.bloom = 0
-let noWB = Look.Analysis(wb: (1, 1, 1))
+let noWB = Look.Analysis(wb: (1, 1, 1), clip: 2.4 * 2) // a typical still: sensor clip × (baseline 0, +1 EV)
 
 /// Render scene-linear patches (one per pixel) → sRGB-encoded output.
 func render(_ patches: [[Double]], _ g: Grade = clean, analysis: Look.Analysis? = noWB) -> [[Double]] {
@@ -52,19 +52,52 @@ let green = residual(Look.wbGains(r: 0.9, g: 1.0, b: 0.9, coverage: 0.5), (0.9, 
 check(abs(green.tint) < 0.1 * log(1 / 0.9), "fluorescent green removed (residual tint \(f3(green.tint)))")
 let warm = residual(Look.wbGains(r: 1.3, g: 1.0, b: 0.7, coverage: 0.5), (1.3, 1.0, 0.7))
 let warmIn = log(1.3 / 0.7) / 2
-check(warm.temp > 0.3 * warmIn && warm.temp < 0.7 * warmIn, "tungsten keeps some warmth (\(Int(100 * warm.temp / warmIn))% kept)")
+check(warm.temp > 0.1 * warmIn && warm.temp < 0.35 * warmIn, "tungsten keeps a little warmth (\(Int(100 * warm.temp / warmIn))% kept)")
 let neon = Look.wbGains(r: 1.3, g: 1.0, b: 0.7, coverage: 0)
 check(neon.0 == 1 && neon.2 == 1, "no neutral surfaces → no correction")
+let shade = residual(Look.wbGains(r: 0.75, g: 1.0, b: 1.3, coverage: 0.5), (0.75, 1.0, 1.3))
+let shadeIn = log(0.75 / 1.3) / 2
+let shadeKept = shade.temp / shadeIn
+check(shadeKept > 0.1 && shadeKept < 0.4, "open shade/snow keeps some blue (\(Int(100 * shadeKept))% kept)")
+
+// 4a. Whole-scene WB (Look.analyze), regions measured from the user's warm-interior DNG (2026-11-18)
+func scene(_ parts: [([Double], Int)]) -> CIImage { // (linear rgb, pixel count) laid out in one row of a 96×96 image
+    var px: [Float] = []
+    for (c, n) in parts { for _ in 0..<n { px += c.map(Float.init) + [1] } }
+    let side = Int(Double(px.count / 4).squareRoot())
+    px = Array(px.prefix(side * side * 4))
+    return CIImage(bitmapData: px.withUnsafeBufferPointer { Data(buffer: $0) }, bytesPerRow: side * 16,
+                   size: CGSize(width: side, height: side), format: .RGBAf, colorSpace: lin)
+}
+func warmthAfter(_ gains: (Double, Double, Double), _ c: [Double]) -> Double { log(c[0] * gains.0 / (c[2] * gains.2)) / 2 }
+let paper = [0.46, 0.245, 0.125], dayRoom = [0.45, 0.53, 0.62], wood = [0.16, 0.068, 0.017]
+let room = Look.analyze(scene([(paper, 5000), (dayRoom, 1300), (wood, 2916)])).wb
+check(warmthAfter(room, paper) < 0.2, "warm interior: white paper ends near-white, not yellow (residual T \(f3(warmthAfter(room, paper))), was 0.66)")
+let sky = [0.6, 0.8, 1.2], grey = [0.3, 0.3, 0.3], grass = [0.08, 0.15, 0.03]
+let day = Look.analyze(scene([(sky, 4000), (grey, 2000), (grass, 3216)])).wb
+check(day.0 <= 1.02 && day.2 >= 0.98, "daylight: blue sky doesn't make the photo warmer (gains \(f3(day.0)), \(f3(day.2)))")
+
+// 4b. Subject lift (doc §7.6): only trusted, genuinely dark, recoverable subjects; capped; After Hours never
+check(Look.subjectGap(subjectY: 0.05, backgroundY: 0.2, coverage: 0.2, decisiveness: 0.9) > 1.9, "dark subject measured ~2 stops under")
+check(Look.subjectGap(subjectY: 0.05, backgroundY: 0.2, coverage: 0.01, decisiveness: 0.9) == 0, "tiny subject ignored")
+check(Look.subjectGap(subjectY: 0.05, backgroundY: 0.2, coverage: 0.2, decisiveness: 0.5) == 0, "mushy mask ignored")
+check(Look.subjectGap(subjectY: 0.001, backgroundY: 0.2, coverage: 0.2, decisiveness: 0.9) == 0, "unrecoverable black subject ignored")
+check(Look.subjectLift(gap: 0.3, maxEV: 0.15) == 0, "subject barely darker → no lift")
+check(Look.subjectLift(gap: 6, maxEV: 0.15) == 0.15, "lift capped at the look's max")
+check(Look.subjectLift(gap: 6, maxEV: Filter.named("afterHours").grade.subjectLift) == 0, "After Hours never lifts faces")
 
 // 5. Hue holds in bright saturated colors (§8.2): a red lamp shouldn't turn yellow as it brightens
 let reds = render([[0.18, 0.02, 0.02], [2.5, 0.28, 0.28]]).map(hue)
 check(abs(reds[1] - reds[0]) < 12, "red hue drift into highlights \(String(format: "%.1f", reds[1] - reds[0]))°")
 
 // 6. Every look keeps neutrals neutral (no tinted whites or colored blacks)
-for f in Filter.all {
+for f in Filter.all + Filter.retired {
     var g = f.grade; g.grain = 0; g.bloom = 0
     let n = render([[0.02, 0.02, 0.02], [0.18, 0.18, 0.18], [1.2, 1.2, 1.2]], g)
     check(n.allSatisfy { chroma($0) < 0.012 }, "\(f.name): neutrals stay neutral (max chroma \(String(format: "%.4f", n.map(chroma).max()!)))")
+    // red light stays red (After Hours' red door; any look): dim vs bright saturated red keep their hue
+    let rr = render([[0.18, 0.02, 0.02], [2.5, 0.28, 0.28]], g).map(hue)
+    check(abs(rr[1] - rr[0]) < 12, "\(f.name): red light keeps its hue (drift \(String(format: "%.1f", rr[1] - rr[0]))°)")
 }
 
 // 7. ColorChecker-like patches: chroma vs colorimetric at the same luminance → Look.chromaNorm
@@ -86,14 +119,49 @@ check(abs(mean - 1) < 0.08, "saturation 1.0 ≈ colorimetric chroma")
 let patch: [[Double]] = [[0.25, 0.15, 0.1], [0.18, 0.18, 0.18], [1.5, 1.5, 1.5]]
 func renderRecipe(_ r: Recipe) -> [[Double]] { var g = r.grade; g.grain = 0; g.bloom = 0; return render(patch, g) }
 let ref = renderRecipe(Recipe())
+// sliders at full travel (doc §8 ranges); Δ ≥ 0.004 ≈ one 8-bit code value
 let sliders: [(String, (inout Recipe) -> Void)] = [
-    ("exposure", { $0.exposure = 0.5 }), ("contrast", { $0.contrast = 1.5 }), ("warmth", { $0.warmth = 0.5 }),
-    ("saturation", { $0.saturation = 1.5 }), ("strength", { $0.filter = "dune"; $0.strength = 0.5 }),
+    ("exposure", { $0.exposure = Recipe.exposureRange.upperBound }), ("contrast", { $0.contrast = Recipe.contrastRange.upperBound }),
+    ("warmth", { $0.warmth = Recipe.warmthRange.upperBound }), ("saturation", { $0.saturation = Recipe.saturationRange.upperBound }),
+    ("look switch", { $0.filter = "afterHours" }),
 ]
 for (name, set) in sliders {
     var r = Recipe(); set(&r)
     let diff = zip(renderRecipe(r).joined(), ref.joined()).map { abs($0 - $1) }.max()!
-    check(diff > 0.01, "\(name) slider changes the image (max Δ \(f3(diff)))")
+    check(diff > 0.004, "\(name) changes the image (max Δ \(f3(diff)))")
 }
+
+// 9. Local contrast: flat areas and neutrals untouched, edges get a little crisper
+var micro = clean; micro.microcontrast = 0.03
+let flat = Array(repeating: [0.18, 0.15, 0.12], count: 16)
+check(zip(render(flat, micro).joined(), render(flat).joined()).allSatisfy { abs($0 - $1) < 1e-3 }, "local contrast leaves flat areas alone")
+let step = Array(repeating: [0.05, 0.05, 0.05], count: 1000) + Array(repeating: [0.5, 0.5, 0.5], count: 1000) // radius scales with size: needs a real-width image
+let crisp = render(step, micro), soft = render(step)
+check(crisp.allSatisfy { chroma($0) < 0.004 }, "local contrast adds no color fringes")
+check(crisp[1001][1] > soft[1001][1] && crisp[998][1] < soft[998][1], "local contrast sharpens the edge (\(f3(soft[1001][1]))→\(f3(crisp[1001][1])))")
+check(abs(crisp[1001][1] - soft[1001][1]) < 0.03, "…but only slightly (no clarity halo)")
+
+// 10. Recipe migration: pre-v10 imported RAW keeps its −1 EV compensation; look and crop survive
+let old = #"{"version":9,"filter":"dune","strength":1,"exposure":-1,"contrast":1,"warmth":0,"saturation":1,"bloom":0,"grain":0,"crop":2}"#
+let mig = try! JSONDecoder().decode(Recipe.self, from: Data(old.utf8))
+check(mig.filter == "dune" && mig.crop == 2 && mig.baseExposure == -1 && mig.exposure == 0 && mig.contrast == 0,
+      "old recipe migrates (look kept, sliders reset, import compensation kept)")
+check(Filter.named("dune").id == "dune", "retired looks still render old photos")
+
+// 11. Phase 1 calibrated curve: white sits at the photo's clip, reached through a shoulder (not a plateau);
+// grey and midtones don't move when the clip level changes (e.g. per-file baseline exposure)
+var refG = Filter.named("naturalReference").grade
+check(refG.grain == 0 && refG.bloom == 0 && refG.microcontrast == 0 && refG.subjectLift == 0 && refG.density == 0
+      && refG.autoWB == 0 && refG.blackLift == 0 && refG.whitePoint == 1, "Natural Reference has no creative stages")
+let clipLin = noWB.clip / pow(2, refG.exposure) // the scene level that lands exactly on the clip after exposure
+let top = render([[clipLin, clipLin, clipLin], [clipLin / 2, clipLin / 2, clipLin / 2], [clipLin / 8, clipLin / 8, clipLin / 8]], refG)
+check(top[0][1] > 0.985, "clipped highlight reaches display white → \(f3(top[0][1]))")
+check(top[1][1] < top[0][1] - 0.01 && top[2][1] < top[1][1] - 0.05, "highlights 1 and 3 stops under the clip stay separated (\(f3(top[2][1])) \(f3(top[1][1])) \(f3(top[0][1])))")
+var hiClip = noWB; hiClip.clip *= 2.5 // a 4× shot (baseline 1.36): same scene, more headroom
+let mids: [[Double]] = [[0.01, 0.01, 0.01], [0.18, 0.18, 0.18], [0.3, 0.2, 0.15]]
+check(zip(render(mids, refG).joined(), render(mids, refG, analysis: hiClip).joined()).allSatisfy { abs($0 - $1) < 0.004 },
+      "clip level moves only the shoulder, not shadows or midtones")
+let refGrey = render([[0.18, 0.18, 0.18]], refG)[0][1]
+check((0.47...0.53).contains(refGrey), "Natural Reference: 18% grey → \(f3(refGrey))")
 
 exit(failed ? 1 : 0)
