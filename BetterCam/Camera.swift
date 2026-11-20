@@ -35,6 +35,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         let exposure: Double
         let metadata: String
         let rendered: CGImage
+        var grainSeed: UInt32? = nil
     }
 
     enum Mode: String, CaseIterable, Identifiable {
@@ -99,6 +100,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     private var _filter = Filter.all[0].id
     private var _exposure = 0.0
     private var _paused = false
+    private var grainSeed = UInt32.random(in: .min ... .max)
     private var _crop = 1.0          // current stop's crop, read by the video queue
     private var _mode = Mode.standard
     private var _bias: Float = 0     // exposure target bias in effect; the viewfinder undoes it like decode does
@@ -241,6 +243,9 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         }
         let generation = lock.withLock { self.generation }
         let preview = settings.flashMode == .off && shown?.generation == generation ? shown : nil
+        if (preview?.filter ?? filter) == Filter.leicaM6.id {
+            lock.withLock { grainSeed = UInt32.random(in: .min ... .max) }
+        }
         let p = Pending(crop: stop.crop, filter: preview?.filter ?? filter, exposure: preview?.exposure ?? exposure,
                         mode: mode, proRAW: settingsAreProRAW(settings),
                         size48: size48, label: stop.label, pressed: pressed, preview: preview)
@@ -599,6 +604,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         if !analyzing, frameCount % 4 == 0 { analyzeAsync(img, generation: generation) }
         var r = Recipe(filter: filter)
         r.exposure = ev
+        if filter == Filter.leicaM6.id { r.grainSeed = lock.withLock { grainSeed } }
         let out = Look.apply(r, to: img, analysis: analysis)
         if let cg = Look.context.createCGImage(out, from: out.extent, format: .RGBA8, colorSpace: Look.outputSpace) {
             let s = 192 / max(img.extent.width, img.extent.height)
@@ -606,7 +612,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             let sample = PreviewSample(input: Look.materialize(small), analysis: analysis, pts: sb.presentationTimeStamp.seconds,
                               received: received, generation: generation, filter: filter, exposure: ev,
                               metadata: Self.parityDiagnostics ? Self.videoMetadata(pb, sb: sb, device: device, bias: bias) : "",
-                              rendered: cg)
+                              rendered: cg, grainSeed: r.grainSeed)
             guard lock.withLock({ self.generation == generation }) else { return }
             onFrame(sample)
         }
@@ -708,11 +714,12 @@ extension Camera.Shot {
     func recipe(for url: URL, diagnosticID: String) -> Recipe {
         var r = Recipe(filter: filter, crop: crop)
         r.exposure = min(max(exposure, Recipe.exposureRange.lowerBound), Recipe.exposureRange.upperBound)
+        if filter == Filter.leicaM6.id { r.grainSeed = preview?.grainSeed ?? UInt32.random(in: .min ... .max) }
         if let preview, (try? Look.saveShutterFrame(preview.rendered, for: url)) != nil {
             r.shutterLook = Recipe.ShutterLook(filter: r.filter, exposure: r.exposure)
         }
         if canMatch, let preview, let input = preview.input,
-           let raw = Look.decode(url, crop: crop, maxSide: 600, normalizeForPreview: true),
+           let raw = Look.decode(url, crop: crop, maxSide: 600, normalizeForPreview: true, unsharpened: r.filter == Filter.leicaM6.id),
            var match = Look.PreviewMatch(raw: raw, video: input, analysis: preview.analysis,
                                          minimumCorrelation: previewDelay > 0.25 ? 0.85 : 0.65) {
             let base = match.apply(to: raw)

@@ -3,6 +3,8 @@ import CoreImage
 import Foundation
 import ImageIO
 
+setbuf(stdout, nil)
+
 let space = Look.workingSpace
 let side = 96
 let bounds = CGRect(x: 0, y: 0, width: side, height: side)
@@ -141,7 +143,86 @@ do {
     print("Shutter frame, P3 JPEG, edits, and missing-frame fallback passed")
 }
 
-let paths = CommandLine.arguments.dropFirst().filter { $0 != "--full-bayer" }
+// Leica print, grain and shutter-parity checks use small images and the same Core Image path as the app.
+let leica = Filter.leicaM6
+precondition(Filter.all.filter { $0.id == leica.id }.count == 1)
+var m6 = Recipe(filter: leica.id)
+m6.grainSeed = 12345
+let restoredM6 = try JSONDecoder().decode(Recipe.self, from: JSONEncoder().encode(m6))
+precondition(restoredM6 == m6)
+
+let gray = CIImage(color: CIColor(red: 0.18, green: 0.18, blue: 0.18, colorSpace: space)!).cropped(to: bounds)
+let untextured = Look.apply(m6.grade, to: gray, analysis: analysis)
+let grained = Look.apply(m6, to: gray, analysis: analysis)
+let repeatRender = Look.apply(m6, to: gray, analysis: analysis)
+let first = Look.PreviewMatch.tiles(grained, size: side)
+let center = (side / 2 * side + side / 2) * 4
+let mean = Look.PreviewMatch.tiles(untextured, size: side)[center]
+let noise = stride(from: 0, to: first.count, by: 4).map { first[$0] / mean - 1 }
+let rms = sqrt(noise.reduce(0) { $0 + $1 * $1 } / Double(noise.count))
+let refGray = Look.PreviewMatch.tiles(Look.apply(Filter.naturalReference.grade, to: gray, analysis: analysis), size: side)[center]
+let grayEV = log2(mean / refGray)
+print("Leica 18% gray shift \(grayEV) EV")
+guard abs(grayEV) <= 0.10 else { fatalError("Leica middle gray should stay anchored") }
+precondition((0.007...0.021).contains(rms), "Leica grain should be visible but fine: \(rms)")
+precondition(first == Look.PreviewMatch.tiles(repeatRender, size: side), "Grain must stay fixed between identical frames")
+precondition(stride(from: 0, to: first.count, by: 4).allSatisfy {
+    abs(first[$0] - first[$0 + 1]) < 0.0005 && abs(first[$0] - first[$0 + 2]) < 0.0005
+}, "Grain and tone must keep neutral materials neutral")
+m6.grainSeed = 23456
+precondition(first != Look.PreviewMatch.tiles(Look.apply(m6, to: gray, analysis: analysis), size: side))
+let overexposed = Look.scaled(grained, 1.35)
+precondition(Look.matchesShutter(grained, repeatRender) && !Look.matchesShutter(grained, overexposed))
+print("Leica neutral grain, repeatability, and shutter match gate passed (grain RMS \(rms))")
+
+let field = CGRect(x: 0, y: 0, width: 600, height: 400)
+let background = CIImage(color: CIColor(red: 0.04, green: 0.04, blue: 0.04, colorSpace: space)!).cropped(to: field)
+let lamp = CIImage(color: CIColor(red: 2.8, green: 1.1, blue: 0.6, colorSpace: space)!)
+    .cropped(to: CGRect(x: 288, y: 185, width: 12, height: 30)).composited(over: background)
+var noDiffusion = leica.grade
+noDiffusion.bloom = 0
+let lampAnalysis = Look.Analysis(wb: (1, 1, 1), clip: 2.5)
+func redAt(_ image: CIImage, x: Int) -> Double {
+    Look.PreviewMatch.tiles(image.cropped(to: CGRect(x: x, y: 198, width: 1, height: 1)), size: 1)[0]
+}
+let glow = Look.apply(leica.grade, to: lamp, analysis: lampAnalysis)
+let plain = Look.apply(noDiffusion, to: lamp, analysis: lampAnalysis)
+let edge = redAt(glow, x: 300) - redAt(plain, x: 300)
+let spill = redAt(glow, x: 310) - redAt(plain, x: 310)
+guard edge > 0.001 && abs(spill) < 0.0001 else { fatalError("Unexpected glow: edge \(edge), spill \(spill)") }
+print("Leica highlight diffusion passed (edge glow, no distant spill)")
+
+let palette: [(String, (Double, Double, Double))] = [
+    ("skin", (0.57, 0.29, 0.20)), ("deep skin", (0.19, 0.087, 0.056)), ("wood", (0.76, 0.23, 0.045)),
+    ("red", (0.88, 0.075, 0.07)), ("teal", (0.028, 0.29, 0.31)), ("blue", (0.07, 0.20, 0.68)),
+    ("neon red", (2.2, 0.21, 0.52)), ("neon cyan", (0.10, 1.23, 1.58)),
+    ("foliage", (0.09, 0.25, 0.045)), ("pastel", (0.60, 0.42, 0.59)),
+    ("snow", (0.85, 0.85, 0.85)), ("black cloth", (0.012, 0.012, 0.012))
+]
+let patchBounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+let patchAnalysis = Look.Analysis(wb: (1, 1, 1), clip: 2.5)
+for (name, (r, g, b)) in palette {
+    let patch = CIImage(color: CIColor(red: r, green: g, blue: b, colorSpace: space)!).cropped(to: patchBounds)
+    func lab(_ grade: Grade) -> (Double, Double, Double) {
+        let pixel = Look.PreviewMatch.tiles(Look.apply(grade, to: patch, analysis: patchAnalysis), size: 1)
+        return OkLab.from((pixel[0], pixel[1], pixel[2]))
+    }
+    let old = lab(Filter.naturalReference.grade), new = lab(leica.grade)
+    let oldC = hypot(old.1, old.2), newC = hypot(new.1, new.2)
+    print(String(format: "%@  L %.3f → %.3f  C %.3f → %.3f", name, old.0, new.0, oldC, newC))
+    if name == "red" || name == "teal" || name == "blue" {
+        precondition(newC > oldC && new.0 < old.0, "\(name) should print richer and denser")
+    }
+    if name.contains("skin") || name == "pastel" { precondition(abs(newC - oldC) < 0.018) }
+    if name == "snow" || name == "black cloth" { precondition(newC < 0.0005) }
+    if name.hasPrefix("neon") {
+        let p3 = Look.sRGBToWorking(OkLab.to(new.0, new.1, new.2), wideGamut: true)
+        precondition(newC > 0.08 && min(p3.0, p3.1, p3.2) > 0 && max(p3.0, p3.1, p3.2) < 1)
+    }
+}
+
+let paths = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("--") }
+let useLeica = CommandLine.arguments.contains("--leica")
 for path in paths {
     autoreleasepool {
         let url = URL(fileURLWithPath: path)
@@ -153,7 +234,8 @@ for path in paths {
         ]).cropped(to: small.extent).settingProperties([Look.clipKey: 1])
         let a = Look.analyze(video)
         guard var m = Look.PreviewMatch(raw: small, video: video, analysis: a) else { fatalError("Fit failed for \(path)") }
-        var r = Recipe(filter: "editorial")
+        var r = Recipe(filter: useLeica ? leica.id : "editorial")
+        if useLeica { r.grainSeed = m6.grainSeed }
         let normalized = m.apply(to: small)
         m.matchDisplay(still: Look.apply(r.grade, to: normalized, analysis: m.analysis(for: normalized)),
                        preview: Look.apply(r.grade, to: video, analysis: a))
@@ -169,7 +251,36 @@ for path in paths {
         let p95 = errors[errors.count * 95 / 100]
         precondition(p95 < 0.05, "Gallery/export mismatch for \(path): \(p95)")
         print("\(url.lastPathComponent) \(Look.isProRAW(url) ? "ProRAW" : "Bayer") \(raw.nativeSize) baseline=\(raw.baselineExposure) gallery/JPEG p95 linear RGB error \(p95)")
-        if path == paths.first, CommandLine.arguments.contains("--full-bayer"), !Look.isProRAW(url),
+        if useLeica, path == paths.first, CommandLine.arguments.contains("--full-leica") {
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let source = dir.appendingPathComponent("shot.dng")
+            try! FileManager.default.createSymbolicLink(at: source, withDestinationURL: url.standardizedFileURL)
+            let guide = Look.apply(r, to: thumb, analysis: ta)
+            let frame = Look.context.createCGImage(guide, from: guide.extent, format: .RGBA8, colorSpace: Look.outputSpace)!
+            try! Look.saveShutterFrame(frame, for: source)
+            r.shutterLook = .init(filter: leica.id, exposure: r.exposure)
+            let shutter = Look.renderPhoto(source, recipe: r)!
+            let jpeg = Look.exportJPEG(source, recipe: r)!
+            let full = CIImage(data: jpeg)!
+            guard full.extent.width * full.extent.height == raw.nativeSize.width * raw.nativeSize.height else {
+                fatalError("Expected native export, got \(full.extent.size); guide \(guide.extent), shutter \(shutter.extent)")
+            }
+            let encoded = CGImageSourceCreateWithData(jpeg as CFData, nil)!
+            let thumbnail = CGImageSourceCreateThumbnailAtIndex(encoded, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 600,
+            ] as CFDictionary)!
+            precondition(Look.matchesShutter(CIImage(cgImage: thumbnail), shutter))
+            let wrongFrame = Look.context.createCGImage(Look.scaled(guide, 0.55), from: guide.extent,
+                                                        format: .RGBA8, colorSpace: Look.outputSpace)!
+            try! Look.saveShutterFrame(wrongFrame, for: source)
+            let fallback = CIImage(data: Look.exportJPEG(source, recipe: r)!)!
+            precondition(fallback.extent.size == shutter.extent.size)
+            print("Leica native as-shot JPEG \(full.extent.size), plus mismatched-frame fallback")
+        }
+        if !useLeica, path == paths.first, CommandLine.arguments.contains("--full-bayer"), !Look.isProRAW(url),
            max(raw.nativeSize.width, raw.nativeSize.height) <= 4032 {
             guard let (full, fa) = Look.photo(url, recipe: r),
                   let data = Look.jpeg(Look.apply(r, to: full, analysis: fa), quality: 0.95),

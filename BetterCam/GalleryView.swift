@@ -62,8 +62,8 @@ struct PhotoView: View {
     @EnvironmentObject private var library: Library
     @Environment(\.dismiss) private var dismiss
     @State private var recipe = Recipe()
-    @State private var base: CIImage?
-    @State private var analysis: Look.Analysis?   // measured once per photo, so sliders stay fast
+    @State private var base: (CIImage, Look.Analysis)?
+    @State private var leicaBase: (CIImage, Look.Analysis)?
     @State private var deleted = false
     @State private var image: UIImage?
     @State private var shutterImage: UIImage?
@@ -150,19 +150,6 @@ struct PhotoView: View {
                 shutterImage = UIImage(contentsOfFile: Look.shutterURL(for: url).path)
                 if r.usesShutterLook { image = shutterImage }
             }
-            let loaded = await Task.detached(priority: .userInitiated) { () -> (CIImage, Look.Analysis)? in
-                let t0 = Date()
-                guard let (base, matchedAnalysis) = Look.photo(url, recipe: r, maxSide: 1600),
-                      let b = Look.materialize(base) else { return nil }
-                let a = matchedAnalysis ?? Look.analyze(b, subject: true)
-                #if DEBUG
-                diag.info("editor load \(Date().timeIntervalSince(t0), format: .fixed(precision: 2))s \(Look.decodeReport(b), privacy: .public) mem \(Look.footprintMB(), format: .fixed(precision: 0))MB")
-                #endif
-                return (b, a)
-            }.value
-            base = loaded?.0
-            analysis = loaded?.1
-            missing = loaded == nil
             await render()
             await renderPreviews()
         }
@@ -212,9 +199,28 @@ struct PhotoView: View {
         }
     }
 
+    private func developed(_ r: Recipe) async -> (CIImage, Look.Analysis)? {
+        let leica = r.filter == Filter.leicaM6.id
+        if let cached = leica ? leicaBase : base { return cached }
+        let url = library.raw(id)
+        let loaded = await Task.detached(priority: .userInitiated) { () -> (CIImage, Look.Analysis)? in
+            let t0 = Date()
+            guard let (source, matched) = Look.photo(url, recipe: r, maxSide: 1600),
+                  let image = Look.materialize(source) else { return nil }
+            let analysis = matched ?? Look.analyze(image, subject: !leica)
+            #if DEBUG
+            diag.info("editor load \(Date().timeIntervalSince(t0), format: .fixed(precision: 2))s \(Look.decodeReport(image), privacy: .public) mem \(Look.footprintMB(), format: .fixed(precision: 0))MB")
+            #endif
+            return (image, analysis)
+        }.value
+        if leica { leicaBase = loaded } else { base = loaded }
+        return loaded
+    }
+
     private func renderPreviews() async {
-        guard let base, let analysis else { return }
+        guard let (base, analysis) = base ?? leicaBase else { return }
         let crop = recipe.crop, base0 = recipe.baseExposure, match = recipe.previewMatch
+        let seed = recipe.grainSeed, url = library.raw(id)
         previews = await Task.detached(priority: .utility) {
             let s = 160 / max(base.extent.width, base.extent.height)
             let small = base.transformed(by: CGAffineTransform(scaleX: s, y: s))
@@ -223,7 +229,8 @@ struct PhotoView: View {
                 var r = Recipe(filter: f.id, crop: crop)
                 r.baseExposure = base0
                 r.previewMatch = match
-                out[f.id] = Look.uiImage(Look.apply(r, to: small, analysis: analysis))
+                r.grainSeed = seed
+                out[f.id] = Look.uiImage(Look.apply(r, to: small, analysis: analysis, source: url))
             }
             return out
         }.value
@@ -238,13 +245,17 @@ struct PhotoView: View {
         var r: Recipe
         repeat {
             r = recipe
-            let a = analysis
             let t0 = Date()
+            let source = await developed(r)
+            missing = source == nil && !(r.usesShutterLook && shutterImage != nil)
             if r.usesShutterLook, let shutterImage {
                 image = shutterImage
-            } else if let base {
-                image = await Task.detached(priority: .userInitiated) { Look.uiImage(Look.apply(r, to: base, analysis: a)) }.value
-            } else {
+            } else if let (base, a) = source {
+                let url = library.raw(id)
+                image = await Task.detached(priority: .userInitiated) {
+                    Look.uiImage(Look.apply(r, to: base, analysis: a, source: url))
+                }.value
+            } else if r == recipe {
                 return
             }
             #if DEBUG
@@ -264,9 +275,7 @@ struct PhotoView: View {
         let t0 = Date()
         let data = await Task.detached(priority: .userInitiated) {
             autoreleasepool {
-                Look.renderPhoto(url, recipe: r).flatMap { image in
-                    Look.jpeg(image.settingProperties(Look.exportProperties(source: url, recipe: r)), quality: 0.95)
-                }
+                Look.exportJPEG(url, recipe: r)
             }
         }.value
         diag.info("export \(Date().timeIntervalSince(t0), format: .fixed(precision: 2))s \(data?.count ?? 0)B mem \(Look.footprintMB(), format: .fixed(precision: 0))MB")

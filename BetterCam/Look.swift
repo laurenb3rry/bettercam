@@ -33,6 +33,10 @@ struct Recipe: Codable, Equatable {
 
     var previewMatch: Look.PreviewMatch?
     var shutterLook: ShutterLook?
+    var grainSeed: UInt32?
+    func grainSeed(for url: URL) -> UInt32 {
+        grainSeed ?? url.lastPathComponent.utf8.reduce(2_166_136_261) { ($0 ^ UInt32($1)) &* 16_777_619 }
+    }
 
     var usesShutterLook: Bool {
         shutterLook == ShutterLook(filter: filter, exposure: exposure)
@@ -51,6 +55,7 @@ struct Recipe: Codable, Equatable {
             previewMatch = match
         }
         shutterLook = try? c.decodeIfPresent(ShutterLook.self, forKey: .shutterLook)
+        grainSeed = try? c.decodeIfPresent(UInt32.self, forKey: .grainSeed)
         guard try c.decodeIfPresent(Int.self, forKey: .version) == Recipe.current else {
             // ponytail: pre-v10 imports stored their −1 compensation in the exposure slider; carry exactly that over
             if let old = try c.decodeIfPresent(Double.self, forKey: .exposure), abs(old + Look.rawCompensation) < 1e-6 {
@@ -86,6 +91,7 @@ struct Recipe: Codable, Equatable {
 enum Look {
     static let workingSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
     static let context = CIContext(options: [.workingColorSpace: workingSpace])
+    private static let leicaExportContext = CIContext(options: [.workingColorSpace: workingSpace, .cacheIntermediates: false])
     static let outputSpace = CGColorSpace(name: CGColorSpace.displayP3)!
 
     /// We underexpose RAW captures by this much (see Camera) to protect highlights, and restore it at decode.
@@ -116,13 +122,13 @@ enum Look {
     static let sRGBToP3: [[Double]] = [[0.822462, 0.177538, 0], [0.033194, 0.966806, 0], [0.017083, 0.072397, 0.910520]]
     static let p3ToSRGB: [[Double]] = [[1.224940, -0.224940, 0], [-0.042057, 1.042057, 0], [-0.019638, -0.078636, 1.098274]]
     /// Working-space linear RGB ↔ linear sRGB (identity unless `workingP3`). Used by the OkLab print transform.
-    static func workingToSRGB(_ r: Double, _ g: Double, _ b: Double) -> (Double, Double, Double) {
-        guard workingP3 else { return (r, g, b) }
+    static func workingToSRGB(_ r: Double, _ g: Double, _ b: Double, wideGamut: Bool = false) -> (Double, Double, Double) {
+        guard workingP3 || wideGamut else { return (r, g, b) }
         let m = p3ToSRGB
         return (m[0][0] * r + m[0][1] * g + m[0][2] * b, m[1][0] * r + m[1][1] * g + m[1][2] * b, m[2][0] * r + m[2][1] * g + m[2][2] * b)
     }
-    static func sRGBToWorking(_ c: (Double, Double, Double)) -> (Double, Double, Double) {
-        guard workingP3 else { return c }
+    static func sRGBToWorking(_ c: (Double, Double, Double), wideGamut: Bool = false) -> (Double, Double, Double) {
+        guard workingP3 || wideGamut else { return c }
         let m = sRGBToP3, (r, g, b) = c
         return (m[0][0] * r + m[0][1] * g + m[0][2] * b, m[1][0] * r + m[1][1] * g + m[1][2] * b, m[2][0] * r + m[2][1] * g + m[2][2] * b)
     }
@@ -237,7 +243,8 @@ enum Look {
     /// ProRAW (Apple's linear recipe, WWDC21 10160): boost 0 removes its default tone curve, localToneMapAmount 0 its
     /// gain-table local tone map, baselineExposure 0 its brightness offset. What's left is Apple's fused, demosaiced,
     /// scene-referred linear data in the DNG's own color profile.
-    static func decode(_ url: URL, crop: Double = 1, maxSide: CGFloat? = nil, normalizeForPreview: Bool = false) -> CIImage? {
+    static func decode(_ url: URL, crop: Double = 1, maxSide: CGFloat? = nil, normalizeForPreview: Bool = false,
+                       unsharpened: Bool = false) -> CIImage? {
         var img: CIImage?
         var clip = 1.0 // display-referred input (HEIC): already tone-mapped to SDR white
         if url.pathExtension.lowercased() == "dng", let raw = CIRAWFilter(imageURL: url) {
@@ -263,7 +270,8 @@ enum Look {
                 }
                 raw.sharpnessAmount *= 1 - 0.5 * strength
             }
-            let proRAW = isProRAW(url)
+        if unsharpened { raw.sharpnessAmount = 0 }
+        let proRAW = isProRAW(url)
             if proRAW { // rest of Apple's linear ProRAW recipe (WWDC21 10160). Bayer: both measured as no-ops (Phase 1)
                 raw.shadowBias = 0
                 raw.isGamutMappingEnabled = false
@@ -762,20 +770,28 @@ enum Look {
 
     /// All new-photo render sizes use the same small RAW-derived portrait guide and frozen viewfinder settings.
     static func photo(_ url: URL, recipe: Recipe, maxSide: CGFloat? = nil) -> (CIImage, Analysis?)? {
+        let unsharpened = recipe.filter == Filter.leicaM6.id
         guard let match = recipe.previewMatch else {
-            return decode(url, crop: recipe.crop, maxSide: maxSide).map { ($0, nil) }
+            return decode(url, crop: recipe.crop, maxSide: maxSide, unsharpened: unsharpened).map { ($0, nil) }
         }
-        guard let guide = decode(url, crop: recipe.crop, maxSide: 600, normalizeForPreview: true) else { return nil }
+        guard let guide = decode(url, crop: recipe.crop, maxSide: 600, normalizeForPreview: true,
+                                 unsharpened: unsharpened) else { return nil }
         let normalized = match.apply(to: guide)
         let a = match.analysis(for: normalized)
         if maxSide == 600 { return (normalized, a) }
-        guard let raw = decode(url, crop: recipe.crop, maxSide: maxSide, normalizeForPreview: true) else { return nil }
+        guard let raw = decode(url, crop: recipe.crop, maxSide: maxSide, normalizeForPreview: true,
+                               unsharpened: unsharpened) else { return nil }
         return (match.apply(to: raw), a)
     }
 
-    static func apply(_ r: Recipe, to base: CIImage, analysis: Analysis? = nil) -> CIImage {
-        let graded = apply(r.grade, to: base, analysis: analysis)
-        return r.previewMatch?.applyDisplay(to: graded) ?? graded
+    static func apply(_ r: Recipe, to base: CIImage, analysis: Analysis? = nil, source: URL? = nil) -> CIImage {
+        let grade = r.grade
+        let graded = apply(grade, to: base, analysis: analysis)
+        // Only use Leica's fitted output gains when the shutter was rendered with Leica.
+        let useDisplayMatch = grade.grain == 0 || r.grainSeed != nil
+        let matched = useDisplayMatch ? r.previewMatch?.applyDisplay(to: graded) ?? graded : graded
+        guard grade.grain > 0 else { return matched }
+        return grain(matched, amount: grade.grain, seed: source.map { r.grainSeed(for: $0) } ?? r.grainSeed ?? 0)
     }
 
     static func shutterURL(for original: URL) -> URL {
@@ -803,13 +819,63 @@ enum Look {
             let scale = min(1, maxSide / max(frame.extent.width, frame.extent.height))
             return frame.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": scale])
         }
-        return photo(url, recipe: recipe, maxSide: maxSide).map { apply(recipe, to: $0.0, analysis: $0.1) }
+        return renderStill(url, recipe: recipe, maxSide: maxSide)
+    }
+
+    private static func renderStill(_ url: URL, recipe: Recipe, maxSide: CGFloat? = nil) -> CIImage? {
+        photo(url, recipe: recipe, maxSide: maxSide).map { apply(recipe, to: $0.0, analysis: $0.1, source: url) }
+    }
+
+    static func exportJPEG(_ url: URL, recipe: Recipe) -> Data? {
+        let metadata = exportProperties(source: url, recipe: recipe)
+        let renderer = recipe.filter == Filter.leicaM6.id ? leicaExportContext : context
+        func encode(_ image: CIImage) -> Data? {
+            jpeg(image.settingProperties(metadata), quality: 0.95, renderer: renderer)
+        }
+
+        if recipe.filter == Filter.leicaM6.id, recipe.usesShutterLook, recipe.previewMatch != nil,
+           let frame = CIImage(contentsOf: shutterURL(for: url)) {
+            let still = autoreleasepool { () -> Data? in
+                guard let guide = renderStill(url, recipe: recipe, maxSide: 600),
+                      matchesShutter(guide, frame),
+                      let full = renderStill(url, recipe: recipe),
+                      max(full.extent.width, full.extent.height) > max(frame.extent.width, frame.extent.height),
+                      let data = encode(full),
+                      let source = CGImageSourceCreateWithData(data as CFData, nil),
+                      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                          kCGImageSourceCreateThumbnailFromImageAlways: true,
+                          kCGImageSourceThumbnailMaxPixelSize: 600,
+                      ] as CFDictionary),
+                      matchesShutter(CIImage(cgImage: thumbnail), frame)
+                else { return nil }
+                return data
+            }
+            return still ?? encode(frame)
+        }
+        return renderPhoto(url, recipe: recipe).flatMap(encode)
+    }
+
+    static func matchesShutter(_ still: CIImage, _ frame: CIImage) -> Bool {
+        let a = still.extent, b = frame.extent
+        guard a.width > 0, b.width > 0, a.height > 0, b.height > 0,
+              abs(log((a.width / a.height) / (b.width / b.height))) < 0.01 else { return false }
+        let x = PreviewMatch.tiles(still, size: 32), y = PreviewMatch.tiles(frame, size: 32)
+        guard !x.isEmpty, x.count == y.count else { return false }
+        let distance = stride(from: 0, to: x.count, by: 4).map { i in
+            let a = OkLab.from((x[i], x[i + 1], x[i + 2]))
+            let b = OkLab.from((y[i], y[i + 1], y[i + 2]))
+            return hypot(a.0 - b.0, hypot(a.1 - b.1, a.2 - b.2))
+        }.sorted()
+        return distance[distance.count / 2] <= 0.018
+            && distance[distance.count * 9 / 10] <= 0.043
+            && distance[distance.count * 98 / 100] <= 0.075
     }
 
     static func apply(_ gr: Grade, to source: CIImage, analysis: Analysis? = nil) -> CIImage {
-        let a = analysis ?? analyze(source, subject: true)
+        let a = analysis ?? analyze(source, subject: !gr.print.wideGamut)
         let gr = gr.resolved(sceneEV: a.sceneEV) // Phase 4 night deltas; identity for looks without them
-        let base = workingP3 ? transformed(source, sRGBToP3) : source
+        let inP3 = workingP3 || gr.print.wideGamut
+        let base = inP3 ? transformed(source, sRGBToP3) : source
         // 1. exposure + white balance + AgX inset, as one linear matrix
         let g = pow(2, gr.exposure)
         let auto = [pow(a.wb.0, gr.autoWB), 1.0, pow(a.wb.2, gr.autoWB)]
@@ -829,9 +895,10 @@ enum Look {
         // 2. white anchor: the photo's clip level after this grade's exposure. Exposure metadata, not image content,
         // so a single specular can't move the curve; grey and midtone slope don't depend on it (see photographic()).
         let white = legacyCurve ? whiteStops : ((log2(a.clip / 0.18) + gr.exposure) * 20).rounded() / 20
-        let top = 0.18 * pow(2, white)
+        let top = lutCeiling(white: white, wideGamut: gr.print.wideGamut)
         let s = 1 / top
-        var exposed = bloom(base, amount: gr.bloom)
+        let diffused = gr.print.wideGamut ? highlightDiffusion(base, clip: a.clip, amount: gr.bloom) : bloom(base, amount: gr.bloom)
+        var exposed = diffused
             .applyingFilter("CIColorMatrix", parameters: ["inputRVector": row(0), "inputGVector": row(1), "inputBVector": row(2)])
         // 1b. a dark, clearly segmented person gets a small lift (doc §7.6: ≤ +0.15 EV, never a fake key light)
         let lift = subjectLift(gap: a.subjectGap, maxEV: gr.subjectLift)
@@ -888,7 +955,7 @@ enum Look {
         // posterizes the shadows (only a few levels below 1%). Encoded, the steps are perceptually even.
         var display = graded.map { microcontrast($0, amount: gr.microcontrast) }?
             .applyingFilter("CISRGBToneCurveToLinear") ?? base
-        if workingP3 { display = transformed(display, p3ToSRGB) } // P3 numbers back to the working space Core Image expects
+        if inP3 { display = transformed(display, p3ToSRGB) } // P3 numbers back to the working space Core Image expects
         return display.cropped(to: source.extent)
     }
 
@@ -1068,14 +1135,17 @@ enum Look {
     /// Shaped scene value → display-encoded (sRGB curve) value.
     static func lut(_ gr: Grade, white: Double) -> Data {
         let n = lutSize
-        let top = 0.18 * pow(2, white)
+        let top = lutCeiling(white: white, wideGamut: gr.print.wideGamut)
         let (grey, slope) = curveShape(gr.contrast)
         func tone(_ v: Double) -> Double {
             let x = log2(max(v, 1e-9) / 0.18)
             return legacyCurve ? filmic(x, hi: whiteStops, k: gr.contrast)
                 : toEncoded(photographic(x, grey: grey, slope: slope, white: white, mid: gr.midContrast, toe: gr.toeWidth))
         }
-        let (kr, kg, kb) = lumaWeights
+        func encodeRatio(_ v: Double) -> Double {
+            gr.print.wideGamut && v > 1 ? 1.055 * pow(v, 1 / 2.4) - 0.055 : toEncoded(v)
+        }
+        let (kr, kg, kb) = gr.print.wideGamut ? (0.2289746, 0.6917385, 0.0792869) : lumaWeights
         var scene = [Double](repeating: 0, count: n), curve = scene
         for i in 0..<n {
             let x = Double(i) / Double(n - 1)
@@ -1097,9 +1167,15 @@ enum Look {
                 let yS = kr * vr + kg * vg + kb * vb
                 if yS > 1e-9 {
                     let k = toLinear(tone(yS)) / yS
-                    cr = (1 - h) * cr + h * toEncoded(vr * k)
-                    cg = (1 - h) * cg + h * toEncoded(vg * k)
-                    cb = (1 - h) * cb + h * toEncoded(vb * k)
+                        var hueHold = h
+                        if gr.print.wideGamut {
+                            let peak = max(vr, vg, vb)
+                            let color = (peak - min(vr, vg, vb)) / peak
+                            hueHold += (1 - h) * 0.72 * Grade.smooth(0.22, 0.72, color) * Grade.smooth(0.35, 0.85, 1.5 * peak / top)
+                        }
+                        cr = (1 - hueHold) * cr + hueHold * encodeRatio(vr * k)
+                        cg = (1 - hueHold) * cg + hueHold * encodeRatio(vg * k)
+                        cb = (1 - hueHold) * cb + hueHold * encodeRatio(vb * k)
                 }
                 let y = kr * cr + kg * cg + kb * cb
                 cr = y + sat * (cr - y); cg = y + sat * (cg - y); cb = y + sat * (cb - y)
@@ -1110,6 +1186,10 @@ enum Look {
             }}}
         }
         return out.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    private static func lutCeiling(white: Double, wideGamut: Bool) -> Double {
+        0.18 * pow(2, white) * (wideGamut ? 1.5 : 1)
     }
 
     /// Calibrated tone curve: scene stops relative to 18% grey → display-linear.
@@ -1154,6 +1234,77 @@ enum Look {
     }
 
     // MARK: - Optional texture (both off by default)
+
+    // shortcut: source kernels keep the Xcode and Swift check paths shared, migrate to a Metal library if startup or SDK support warrants it.
+    private static let highlightSource = CIColorKernel(source: """
+        kernel vec4 highlightSource(__sample pixel, float clip) {
+            vec3 rgb = max(pixel.rgb, 0.0) / clip;
+            float peak = max(rgb.r, max(rgb.g, rgb.b));
+            float y = dot(rgb, vec3(0.229, 0.692, 0.079));
+            float source = smoothstep(0.81, 1.0, peak) * smoothstep(0.20, 0.60, y);
+            return vec4(rgb * source / max(1.0, peak), 1.0);
+        }
+        """)
+
+    private static let highlightEdge = CIColorKernel(source: """
+        kernel vec4 highlightEdge(__sample base, __sample source, __sample blur, float clip, float amount) {
+            float y = dot(base.rgb, vec3(0.229, 0.692, 0.079)) / clip;
+            vec3 spread = max(blur.rgb - source.rgb, 0.0);
+            float red = max(spread.r - max(spread.g, spread.b), 0.0);
+            vec3 halo = spread + red * vec3(0.26, 0.06, 0.0);
+            return vec4(base.rgb + halo * (amount * clip * (1.0 - smoothstep(0.32, 0.82, y))), base.a);
+        }
+        """)
+
+    private static func highlightDiffusion(_ image: CIImage, clip: Double, amount: Double) -> CIImage {
+        let e = image.extent
+        guard amount > 0, let source = highlightSource?.apply(extent: e, arguments: [image, clip]) else { return image }
+        let side = max(e.width, e.height)
+        let scale = min(1, 800 / side)
+        let blur = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .clampedToExtent().applyingGaussianBlur(sigma: side * scale * 0.0018)
+            .transformed(by: CGAffineTransform(scaleX: 1 / scale, y: 1 / scale)).cropped(to: e)
+        return highlightEdge?.apply(extent: e, arguments: [image, source, blur, clip, amount]) ?? image
+    }
+
+    private static let grainKernel = CIColorKernel(source: """
+        float grainCell(vec2 p) {
+            vec3 q = fract(p.xyx * vec3(0.1031, 0.11369, 0.13787));
+            q += dot(q, q.yzx + 19.19);
+            return fract((q.x + q.y) * q.z);
+        }
+
+        kernel vec4 filmGrain(__sample pixel, vec2 center, float scale, vec2 seed, float amount) {
+            vec3 rgb = pixel.rgb;
+            float peak = max(rgb.r, max(rgb.g, rgb.b));
+            float low = min(rgb.r, min(rgb.g, rgb.b));
+            float y = clamp(dot(rgb, vec3(0.229, 0.692, 0.079)), 0.0, 1.0);
+            // A fitted preview correction can move colors outside P3. Bring them back along the neutral axis.
+            float gamut = min(1.0, min(y / max(y - low, 0.00001), (1.0 - y) / max(peak - y, 0.00001)));
+            rgb = mix(vec3(y), rgb, gamut);
+            vec2 p = (destCoord() - center) * scale + seed;
+            vec2 cell = floor(p);
+            vec2 f = smoothstep(vec2(0.0), vec2(1.0), fract(p));
+            float noise = mix(mix(grainCell(cell), grainCell(cell + vec2(1.0, 0.0)), f.x),
+                              mix(grainCell(cell + vec2(0.0, 1.0)), grainCell(cell + vec2(1.0, 1.0)), f.x), f.y) - 0.5;
+            float envelope = smoothstep(0.002, 0.045, y) * (1.0 - smoothstep(0.45, 0.97, y));
+            float warm = smoothstep(0.015, 0.10, rgb.r - rgb.g) * smoothstep(0.0, 0.08, rgb.g - rgb.b);
+            float gain = amount * noise * envelope * mix(1.0, 0.7, warm) / sqrt(max(y, 0.035));
+            float white = max(rgb.r, max(rgb.g, rgb.b));
+            return vec4(rgb * min(1.0 + gain, 1.0 / max(white, 0.00001)), pixel.a);
+        }
+        """)
+
+    private static func grain(_ image: CIImage, amount: Double, seed: UInt32) -> CIImage {
+        guard amount > 0 else { return image }
+        let e = image.extent
+        let scale = min(1.0, 920 / min(e.height, e.width))
+        let offset = CIVector(x: Double(seed & 0xffff) / 19, y: Double(seed >> 16) / 19)
+        guard let grained = grainKernel?.apply(extent: e, arguments: [
+            transformed(image, sRGBToP3), CIVector(x: e.midX, y: e.midY), scale, offset, amount,
+        ]) else { return image }
+        return transformed(grained, p3ToSRGB)
+    }
 
     /// Halation-style glow: only the brightest parts, warm, wide and soft. Applied in scene light like on film.
     static func bloom(_ img: CIImage, amount: Double) -> CIImage {
@@ -1225,8 +1376,8 @@ enum Look {
         return props
     }
 
-    static func jpeg(_ img: CIImage, quality: Double = 0.85) -> Data? {
-        context.jpegRepresentation(of: img, colorSpace: outputSpace,
+    static func jpeg(_ img: CIImage, quality: Double = 0.85, renderer: CIContext = context) -> Data? {
+        renderer.jpegRepresentation(of: img, colorSpace: outputSpace,
                                    options: [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): quality])
     }
 

@@ -42,6 +42,7 @@ struct Grade: Equatable {
     // Phase 4 (research/14-phase4-look-collection.md). Neutral defaults; EDITORIAL B doesn't set them.
     var skinRegion = false    // skinChromaLocal over the person's measured skin color (face, neck, arms, hands), not the face ellipse only
     var night: Night? = nil   // extra moves faded in by scene darkness (EXIF EV), so a lit room isn't graded like a night street
+    var grain = 0.0
 
     /// Deltas at full darkness (EV ≤ `darkEV`), none at EV ≥ `lightEV`, smooth in between (quantized to quarters: LUT cache).
     struct Night: Equatable {
@@ -66,6 +67,7 @@ struct Grade: Equatable {
     struct Print: Equatable {
         static let centers: [Double] = [30, 60, 105, 145, 200, 260, 325] // OkLab hue: red, skin/orange, yellow, green, cyan, blue, magenta
         var on = false
+        var wideGamut = false
         var hueShift = [Double](repeating: 0, count: 7)   // degrees
         var chroma = [Double](repeating: 1, count: 7)     // ×, midtones
         var shadowChroma = [Double](repeating: 1, count: 7)    // extra × in shadows (L ≲ 0.45)
@@ -84,13 +86,14 @@ struct Grade: Equatable {
             guard on else { return "p0" }
             let parts: [[Double]] = [hueShift, chroma, shadowChroma, highlightChroma, luma, shadowSplit, highlightSplit, [density, skinChroma, gamutKnee]]
             let extra = skinProtect == 0 && skinHue == 0 ? "" : String(format: ",sp%.4f,%.4f", skinProtect, skinHue)
-            return parts.joined().map { String(format: "%.4f", $0) }.joined(separator: ",") + extra
+            return parts.joined().map { String(format: "%.4f", $0) }.joined(separator: ",") + extra + (wideGamut ? ",p3" : "")
         }
 
         static func mix(_ a: Print, _ b: Print, _ t: Double) -> Print {
             func m(_ x: [Double], _ y: [Double]) -> [Double] { zip(x, y).map { $0 + ($1 - $0) * t } }
             var p = a
             p.on = a.on || b.on
+            p.wideGamut = a.wideGamut || b.wideGamut
             p.hueShift = m(a.hueShift, b.hueShift); p.chroma = m(a.chroma, b.chroma); p.luma = m(a.luma, b.luma)
             p.shadowChroma = m(a.shadowChroma, b.shadowChroma); p.highlightChroma = m(a.highlightChroma, b.highlightChroma)
             p.shadowSplit = m(a.shadowSplit, b.shadowSplit); p.highlightSplit = m(a.highlightSplit, b.highlightSplit)
@@ -116,24 +119,41 @@ struct Grade: Equatable {
 
         /// Encoded working RGB in → encoded working RGB out, inside the working gamut.
         func apply(_ r: Double, _ g: Double, _ b: Double) -> (Double, Double, Double) {
-            func lin(_ v: Double) -> Double { v < 0 ? -Look.toLinear(-v) : Look.toLinear(v) }
-            var (L, A, B) = OkLab.from(Look.workingToSRGB(lin(r), lin(g), lin(b)))
+            func lin(_ v: Double) -> Double {
+                if wideGamut && abs(v) > 1 { return copysign(pow((abs(v) + 0.055) / 1.055, 2.4), v) }
+                return v < 0 ? -Look.toLinear(-v) : Look.toLinear(v)
+            }
+            var (L, A, B) = OkLab.from(Look.workingToSRGB(lin(r), lin(g), lin(b), wideGamut: wideGamut))
             let C0 = hypot(A, B)
+            if wideGamut {
+                let coloredHighlight = Grade.smooth(0.065, 0.22, C0) * Grade.smooth(0.68, 0.93, L)
+                L = min(0.9999, L - 0.095 * coloredHighlight)
+            }
             guard C0 > 1e-6 || shadowSplit != [0, 0] || highlightSplit != [0, 0] else { return (r, g, b) }
             var h = atan2(B, A) * 180 / .pi; if h < 0 { h += 360 }
             let cw = Grade.smooth(0.015, 0.08, C0) // how "colorful": hue/luma moves fade out toward neutral
             let sh = 1 - Grade.smooth(0.25, 0.6, L), hi = Grade.smooth(0.65, 0.95, L)
             // skin: wide soft gate on hue 35–85° and moderate chroma (orange paint and red dresses are more chromatic)
-            let skinW = Grade.smooth(0, 1, 1 - abs(h - 60) / 30) * Grade.smooth(0.01, 0.03, C0) * (1 - Grade.smooth(0.13, 0.2, C0))
+            let skinHueW = wideGamut
+                ? Grade.smooth(29, 46, h) * (1 - Grade.smooth(72, 91, h))
+                : Grade.smooth(0, 1, 1 - abs(h - 60) / 30)
+            let skinW = skinHueW * Grade.smooth(0.01, 0.03, C0) * (1 - Grade.smooth(0.13, 0.2, C0))
             let keep = 1 - skinProtect * skinW // 1 unless skinProtect: then skin ignores the sector moves around it
             // hue-vs-hue, hue-vs-chroma by luminance band
             let h2 = (h + Print.at(hueShift, h) * cw * keep + skinHue * skinW) * .pi / 180
             let kS: Double = 1 + (Print.at(shadowChroma, h) - 1) * sh
             let kH: Double = 1 + (Print.at(highlightChroma, h) - 1) * hi
             var C: Double = C0 * Print.at(chroma, h) * kS * kH
-            C *= 1 + (skinChroma - 1) * skinW
             // hue-vs-luminance and subtractive density (colorful = deeper, like dye)
-            L *= (1 + Print.at(luma, h) * cw * keep) * (1 - density * keep * min(C, 0.25))
+            let skinScale = 1 + (skinChroma - 1) * skinW
+            if wideGamut {
+                C = (C0 + (C - C0) * cw * keep) * skinScale
+                let mid = Grade.smooth(0.16, 0.52, L) * (1 - Grade.smooth(0.70, 0.97, L))
+                L -= mid * cw * keep * (density * Grade.smooth(0.05, 0.21, C) - L * Print.at(luma, h))
+            } else {
+                C *= skinScale
+                L *= (1 + Print.at(luma, h) * cw * keep) * (1 - density * keep * min(C, 0.25))
+            }
             // split tone scales with L in the shadows, so black stays neutral (a print's D-max is neutral) and only the
             // shadow *tones* carry the crossover; a constant offset turned near-black visibly teal
             let ws = sh * (1 - hi) * min(L / 0.55, 1)
@@ -144,7 +164,7 @@ struct Grade: Equatable {
             if Cn > 1e-6 {
                 let hx = A / Cn, hy = B / Cn
                 func inside(_ c: Double) -> Bool {
-                    let (x, y, z) = Look.sRGBToWorking(OkLab.to(L, c * hx, c * hy))
+                    let (x, y, z) = Look.sRGBToWorking(OkLab.to(L, c * hx, c * hy), wideGamut: wideGamut)
                     return min(x, y, z) >= -1e-4 && max(x, y, z) <= 1 + 1e-4
                 }
                 var lo = 0.0, hiC = 0.5
@@ -158,7 +178,7 @@ struct Grade: Equatable {
                     }
                 }
             }
-            let (x, y, z) = Look.sRGBToWorking(OkLab.to(min(max(L, 0), 1), A, B))
+            let (x, y, z) = Look.sRGBToWorking(OkLab.to(min(max(L, 0), 1), A, B), wideGamut: wideGamut)
             return (Look.toEncoded(x), Look.toEncoded(y), Look.toEncoded(z))
         }
     }
@@ -171,7 +191,7 @@ struct Grade: Equatable {
         \.exposure, \.contrast, \.blackLift, \.whitePoint, \.saturation, \.autoWB, \.temperature, \.tint,
         \.warmSat, \.warmShift, \.greenSat, \.greenShift, \.blueSat, \.blueShift, \.density, \.bloom,
         \.microcontrast, \.subjectLift, \.midContrast, \.toeWidth, \.hueHold, \.shadowChroma, \.highlightChroma,
-        \.skinSat, \.greenCompress, \.warmAdapt, \.tintAdapt, \.faceLift, \.backgroundTone, \.skinChromaLocal,
+        \.skinSat, \.greenCompress, \.warmAdapt, \.tintAdapt, \.faceLift, \.backgroundTone, \.skinChromaLocal, \.grain,
     ]
 
     /// A look at partial strength: every rendering *parameter* is interpolated (t = 0 → `a`, 1 → `b`) and the result is
@@ -201,6 +221,7 @@ struct Grade: Equatable {
     /// Scalar in/out: this runs ~36k times per LUT, and array allocations made it slow in Debug builds.
     func finish(_ ri: Double, _ gi: Double, _ bi: Double) -> (Double, Double, Double) {
         let (rp, gp, bp) = print.on ? print.apply(ri, gi, bi) : (ri, gi, bi) // gamut-mapped before the clamp below
+        if print.wideGamut { return (rp, gp, bp) }
         let r0 = min(max(rp, 0), 1), g0 = min(max(gp, 0), 1), b0 = min(max(bp, 0), 1)
         let (kr, kg, kb) = Look.lumaWeights
         let y = kr * r0 + kg * g0 + kb * b0
@@ -292,9 +313,9 @@ struct Filter: Identifiable, Equatable {
     /// First = default for new photos and the camera. Editorial set (research/newFilters_11_18.md) leads, in its launch order.
     /// Debug builds also list the Natural Reference, so it can be picked on the phone without shipping it.
     #if DEBUG
-    static let all: [Filter] = [editorial, riviera, sunStudy, afterHours, alpine, chroma, natural, naturalReference]
+    static let all: [Filter] = [editorial, leicaM6, riviera, sunStudy, afterHours, alpine, chroma, natural, naturalReference]
     #else
-    static let all: [Filter] = [editorial, riviera, sunStudy, afterHours, alpine, chroma, natural]
+    static let all: [Filter] = [editorial, leicaM6, riviera, sunStudy, afterHours, alpine, chroma, natural]
     #endif
     /// Out of the app but kept: photos already saved with them still render with their look.
     static let retired: [Filter] = [editorialPhase3, editorialV1, portra, eterna, cmbyn, dune, br2049, classicChrome, nostalgicNeg]
@@ -331,6 +352,25 @@ struct Filter: Identifiable, Equatable {
         g.density = 0; g.bloom = 0; g.microcontrast = 0; g.subjectLift = 0
         return Filter(id: "naturalReference", name: "Reference", grade: g)
     }()
+
+    static let leicaM6 = Filter(id: "leicaM6", name: "LEICA M6", grade: {
+        var g = naturalReference.grade
+        g.exposure -= 0.04
+        g.midContrast = 0.31; g.toeWidth = 1.35
+        g.hueHold = 0.63
+        g.bloom = 0.035; g.grain = 0.035
+        var p = Grade.Print()
+        p.on = true; p.wideGamut = true
+        // Red canopy, varnish, turf, open water and twilight each occupy different parts of the print gamut.
+        p.chroma          = [1.19, 1.13, 1.03, 0.97, 1.18, 1.13, 1.08]
+        p.shadowChroma    = [1.02, 0.99, 0.96, 0.96, 1.04, 1.03, 1.00]
+        p.highlightChroma = [0.96, 0.94, 0.91, 0.90, 0.90, 0.92, 0.93]
+        p.hueShift        = [1.5, 0, -2, 3, -4, 2, 0]
+        p.luma            = [-0.043, -0.018, 0.012, -0.026, -0.045, -0.065, -0.010]
+        p.density = 0.020; p.skinProtect = 0.95; p.skinChroma = 0.87; p.gamutKnee = 0.87
+        g.print = p
+        return g
+    }())
 
     // Editorial set (research/newFilters_11_18.md §5), tuned 2026-11-18 by eye against the user's 23 reference photos
     // (the doc's own values were too close to tell apart). Still no tints: differences are tone, density and per-hue
