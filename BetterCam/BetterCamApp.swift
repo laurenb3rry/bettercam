@@ -7,6 +7,7 @@ struct BetterCamApp: App {
             CameraView()
                 .preferredColorScheme(.dark)
                 .tint(Color("AccentColor"))
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in Look.purge() }
         }
     }
 }

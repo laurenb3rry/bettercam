@@ -248,7 +248,7 @@ var curves: [String: Any] = [:]
 let flat = Look.Analysis(wb: (1, 1, 1), clip: analysis.clip)
 let curveSet = rendered.filter { $0.name == "Natural Reference" || $0.name == "EDITORIAL B" || $0.name.hasSuffix("P4 global") }
 for r in curveSet {
-    var g = r.grade; g.grain = 0; g.bloom = 0
+    var g = r.grade; g.bloom = 0
     let grey = labPixels(Look.apply(g, to: ramp((1, 1, 1)), analysis: flat)), red = labPixels(Look.apply(g, to: ramp((1, 0.12, 0.08)), analysis: flat))
     let skin = labPixels(Look.apply(g, to: ramp((0.62, 0.42, 0.33)), analysis: flat))
     curves[r.name] = ["stops": rampStops, "greyL": grey.L, "redL": red.L, "redC": zip(red.a, red.b).map { hypot($0, $1) },

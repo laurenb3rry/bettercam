@@ -8,7 +8,7 @@ let lin = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
 var failed = false
 func check(_ ok: Bool, _ msg: String) { print(ok ? "ok  " : "FAIL", msg); if !ok { failed = true } }
 
-var clean = Grade.natural; clean.grain = 0; clean.bloom = 0
+var clean = Grade.natural; clean.bloom = 0
 let noWB = Look.Analysis(wb: (1, 1, 1), clip: 2.4 * 2) // a typical still: sensor clip × (baseline 0, +1 EV)
 
 /// Render scene-linear patches (one per pixel) → sRGB-encoded output.
@@ -93,7 +93,7 @@ check(abs(reds[1] - reds[0]) < 12, "red hue drift into highlights \(String(forma
 // 6. Every look keeps neutrals neutral (no tinted whites or colored blacks). Looks with an authored print split tone
 // (Grade.Print, research/13) are bounded by §17 instead: amber highlights / teal shadow tones are the look, white and black aren't.
 for f in Filter.all + Filter.retired where !f.grade.print.on {
-    var g = f.grade; g.grain = 0; g.bloom = 0
+    var g = f.grade; g.bloom = 0
     let n = render([[0.02, 0.02, 0.02], [0.18, 0.18, 0.18], [1.2, 1.2, 1.2]], g)
     check(n.allSatisfy { chroma($0) < 0.012 }, "\(f.name): neutrals stay neutral (max chroma \(String(format: "%.4f", n.map(chroma).max()!)))")
     // red light stays red (After Hours' red door; any look): dim vs bright saturated red keep their hue
@@ -118,7 +118,7 @@ check(abs(mean - 1) < 0.08, "saturation 1.0 ≈ colorimetric chroma")
 
 // 8. Every editor slider visibly changes the photo (a mid-tone skin-ish patch and a grey)
 let patch: [[Double]] = [[0.25, 0.15, 0.1], [0.18, 0.18, 0.18], [1.5, 1.5, 1.5]]
-func renderRecipe(_ r: Recipe) -> [[Double]] { var g = r.grade; g.grain = 0; g.bloom = 0; return render(patch, g) }
+func renderRecipe(_ r: Recipe) -> [[Double]] { var g = r.grade; g.bloom = 0; return render(patch, g) }
 let ref = renderRecipe(Recipe())
 // sliders at full travel (doc §8 ranges); Δ ≥ 0.004 ≈ one 8-bit code value
 let sliders: [(String, (inout Recipe) -> Void)] = [
@@ -152,7 +152,7 @@ check(Filter.named("dune").id == "dune", "retired looks still render old photos"
 // 11. Phase 1 calibrated curve: white sits at the photo's clip, reached through a shoulder (not a plateau);
 // grey and midtones don't move when the clip level changes (e.g. per-file baseline exposure)
 var refG = Filter.named("naturalReference").grade
-check(refG.grain == 0 && refG.bloom == 0 && refG.microcontrast == 0 && refG.subjectLift == 0 && refG.density == 0
+check(refG.bloom == 0 && refG.microcontrast == 0 && refG.subjectLift == 0 && refG.density == 0
       && refG.autoWB == 0 && refG.blackLift == 0 && refG.whitePoint == 1, "Natural Reference has no creative stages")
 let clipLin = noWB.clip / pow(2, refG.exposure) // the scene level that lands exactly on the clip after exposure
 let top = render([[clipLin, clipLin, clipLin], [clipLin / 2, clipLin / 2, clipLin / 2], [clipLin / 8, clipLin / 8, clipLin / 8]], refG)
@@ -243,10 +243,10 @@ if let dir = samples, let urls = try? FileManager.default.contentsOfDirectory(at
 // (Natural Reference itself is frozen by checks/golden on real files.)
 do {
     let nr = Filter.naturalReference.grade
-    var e100 = Filter.editorialFull; e100.grain = 0
-    var nrClean = nr; nrClean.grain = 0
+    let e100 = Filter.editorialFull
+    let nrClean = nr
     func same(_ x: Grade, _ y: Grade) -> Bool {
-        x.lutKey == y.lutKey && abs(x.exposure - y.exposure) < 1e-9 && abs(x.grain - y.grain) < 1e-9 && x.autoWB == y.autoWB
+        x.lutKey == y.lutKey && abs(x.exposure - y.exposure) < 1e-9 && x.autoWB == y.autoWB
     }
     check(same(Grade.mix(nr, Filter.editorialFull, 0), nr) && same(Grade.mix(nr, Filter.editorialFull, 1), Filter.editorialFull),
           "EDITORIAL strength 0 = Natural Reference, 1 = full look (parameters, not images)")
@@ -282,7 +282,7 @@ do {
     let id = p.apply(0.4, 0.3, 0.2)
     check(abs(id.0 - 0.4) < 1e-4 && abs(id.1 - 0.3) < 1e-4 && abs(id.2 - 0.2) < 1e-4, "Print transform at neutral settings is the identity")
     for c in [Filter.editorial] {
-        var g = c.grade; g.grain = 0; g.bloom = 0
+        var g = c.grade; g.bloom = 0
         let ramp = stride(from: -6.0, through: 2.0, by: 1.0).map { s in [0.18 * pow(2, s), 0.18 * pow(2, s), 0.18 * pow(2, s)] }
         let out = render(ramp, g)
         let white = render([[noWB.clip, noWB.clip, noWB.clip]], g)[0], black = render([[0.0005, 0.0005, 0.0005]], g)[0]

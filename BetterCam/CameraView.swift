@@ -9,20 +9,40 @@ struct CameraView: View {
     @State private var showName = false
     @State private var flash = false
     @AppStorage("grid") private var grid = false
-    @AppStorage("rawMode") private var rawMode = Camera.Mode.bayer.rawValue
+    @AppStorage("rawMode") private var rawMode = Camera.Mode.standard.rawValue
+    @State private var ev = 0.0          // render exposure, vertical drag on the viewfinder
+    @State private var evStart = 0.0
+    @State private var blink = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         VStack(spacing: 20) {
             PreviewView(camera: camera) { camera.focus(at: $0) } // 2× crop is done on the frames (Camera.captureOutput)
                 .aspectRatio(3 / 4, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 4))
-                // swipe left/right through the film looks, like Instagram story filters
-                .gesture(DragGesture(minimumDistance: 30).onEnded { g in
+                // swipe left/right through the film looks, like Instagram story filters; up/down: exposure
+                .gesture(DragGesture(minimumDistance: 30).onChanged { g in
+                    guard abs(g.translation.height) > abs(g.translation.width) else { return }
+                    ev = min(max(evStart - g.translation.height / 250, Recipe.exposureRange.lowerBound), Recipe.exposureRange.upperBound)
+                    ev = (ev * 10).rounded() / 10
+                }.onEnded { g in
+                    evStart = ev
                     guard abs(g.translation.width) > abs(g.translation.height) else { return }
                     let all = Filter.all, i = all.firstIndex { $0.id == filterID } ?? 0
                     let next = g.translation.width < 0 ? min(i + 1, all.count - 1) : max(i - 1, 0)
                     if next != i { filterID = all[next].id }
                 })
+                .overlay { Color.black.opacity(blink ? 0.6 : 0).allowsHitTesting(false) } // capture feedback
+                .overlay(alignment: .bottom) {
+                    if ev != 0 { // tap to reset
+                        Button { ev = 0; evStart = 0 } label: {
+                            Label(String(format: "%+.1f", ev), systemImage: "sun.max")
+                                .font(.footnote.weight(.semibold)).foregroundStyle(.white)
+                                .padding(.horizontal, 10).frame(height: 30).background(.black.opacity(0.45), in: Capsule())
+                        }
+                        .padding(10)
+                    }
+                }
                 .overlay { if grid { ThirdsGrid() } }
                 .overlay(alignment: .top) { filterBadge }
                 .overlay(alignment: .topLeading) {
@@ -31,17 +51,7 @@ struct CameraView: View {
                             toggle(flash ? "bolt.fill" : "bolt.slash", on: flash) { flash.toggle() }
                         }
                         toggle("grid", on: grid) { grid.toggle() }
-                        #if DEBUG
-                        Menu { // Phase 2 capture experiment (research/11-phase2-capture.md)
-                            Picker("Capture", selection: $rawMode) {
-                                ForEach(Camera.Mode.allCases) { Text($0.rawValue).tag($0.rawValue) }
-                            }
-                        } label: {
-                            Text(String(rawMode.prefix(1)))
-                                .font(.footnote.weight(.bold)).foregroundStyle(.white)
-                                .frame(width: 34, height: 34).background(.black.opacity(0.35), in: Circle())
-                        }
-                        #endif
+                        formatChip
                     }
                     .padding(10)
                 }
@@ -73,6 +83,7 @@ struct CameraView: View {
                         .padding(5).overlay(Circle().stroke(.white, lineWidth: 3))
                         .opacity(camera.busy ? 0.4 : 1)
                 }
+                .disabled(camera.busy)
                 Spacer()
                 Button { camera.flip() } label: {
                     Image(systemName: "arrow.triangle.2.circlepath")
@@ -100,19 +111,29 @@ struct CameraView: View {
         }
         .task {
             camera.onCapture = { shot in Task { @MainActor in await library.add(shot) } }
-            #if DEBUG
-            camera.start(preferred: lastLens, mode: Camera.Mode(rawValue: rawMode) ?? .bayer)
-            #else
-            camera.start(preferred: lastLens)
-            #endif
+            camera.start(preferred: lastLens, mode: Camera.Mode(rawValue: rawMode) ?? .standard)
         }
+        .onChange(of: ev) { _, v in camera.exposure = v }
+        .onChange(of: camera.shutterCount) {
+            blink = true
+            withAnimation(.easeOut(duration: 0.25).delay(0.05)) { blink = false }
+        }
+        .onChange(of: scenePhase) { _, p in if p == .active { camera.resume() } }
         .onChange(of: camera.current) { _, stop in if let stop { lastLens = stop.id } }
-        .onChange(of: rawMode) { _, m in camera.mode = Camera.Mode(rawValue: m) ?? .bayer }
+        .onChange(of: rawMode) { _, m in camera.mode = Camera.Mode(rawValue: m) ?? .standard }
         .onChange(of: showGallery) { _, open in camera.paused = open }
         .alert("bettercam", isPresented: Binding { camera.error != nil } set: { if !$0 { camera.error = nil } }) {
+            if camera.permissionDenied {
+                Button("Settings") { UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!) }
+            }
             Button("OK") {}
         } message: {
             Text(camera.error ?? "")
+        }
+        .alert("bettercam", isPresented: Binding { library.message != nil && !showGallery } set: { if !$0 { library.message = nil } }) {
+            Button("OK") {}
+        } message: {
+            Text(library.message ?? "")
         }
     }
 }
@@ -125,6 +146,25 @@ extension CameraView {
                 .foregroundStyle(on ? Color.accentColor : .white)
                 .frame(width: 34, height: 34)
                 .background(.black.opacity(0.35), in: Circle())
+        }
+    }
+
+    /// What the next shot will actually be (checked against the file after every shot). Tap to pick the capture format;
+    /// the choice is remembered. Debug builds also list the fixed −1 EV Bayer mode for comparisons.
+    private var formatChip: some View {
+        Menu {
+            Picker("Capture", selection: $rawMode) {
+                ForEach(Camera.Mode.allCases.filter { m in
+                    #if DEBUG
+                    true
+                    #else
+                    m != .bayerFixed
+                    #endif
+                }) { Text($0.rawValue).tag($0.rawValue) }
+            }
+        } label: {
+            Text(camera.format).font(.caption2.weight(.bold)).foregroundStyle(.white)
+                .padding(.horizontal, 8).frame(height: 34).background(.black.opacity(0.35), in: Capsule())
         }
     }
 
@@ -164,17 +204,27 @@ struct ThirdsGrid: View {
     }
 }
 
+/// Grid/thumbnail tile. Decoded off the main thread and cached (by path + file date), so the gallery scrolls smoothly.
 struct Thumb: View {
     let url: URL?
+    @State private var image: UIImage?
+    private static let cache = NSCache<NSString, UIImage>()
 
     var body: some View {
         Rectangle().fill(.white.opacity(0.08))
             .aspectRatio(1, contentMode: .fit)
             .overlay {
-                if let url, let img = UIImage(contentsOfFile: url.path) {
-                    Image(uiImage: img).resizable().scaledToFill()
-                }
+                if let image { Image(uiImage: image).resizable().scaledToFill() }
             }
             .clipped()
+            .task(id: url) {
+                guard let url else { image = nil; return }
+                let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                let key = "\(url.path)@\(date.timeIntervalSince1970)" as NSString
+                if let hit = Self.cache.object(forKey: key) { image = hit; return }
+                let img = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: url.path)?.preparingForDisplay() }.value
+                if let img { Self.cache.setObject(img, forKey: key) }
+                image = img
+            }
     }
 }

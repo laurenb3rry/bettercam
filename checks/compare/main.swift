@@ -74,7 +74,7 @@ func save(_ img: CIImage, _ name: String) {
 }
 
 func render(_ base: CIImage, _ filter: String) -> CIImage {
-    Look.apply(Filter.named(filter).grade, to: base, analysis: Look.analyze(base, subject: true)) // as shipped, grain included
+    Look.apply(Filter.named(filter).grade, to: base, analysis: Look.analyze(base, subject: true))
 }
 
 let metricsURL = out.appendingPathComponent("metrics.json") // merged, so files can be added in later runs

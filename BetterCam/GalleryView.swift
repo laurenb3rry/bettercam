@@ -66,11 +66,14 @@ struct PhotoView: View {
     @State private var analysis: Look.Analysis?   // measured once per photo, so sliders stay fast
     @State private var deleted = false
     @State private var image: UIImage?
+    @State private var shutterImage: UIImage?
     @State private var tool = Tool.film
     @State private var exporting = false
     @State private var message: String?
     @State private var confirmDelete = false
     @State private var rendering = false
+    @State private var missing = false
+    @State private var shareURL: URL?
 
     enum Tool: String, CaseIterable { case film = "Look", tone = "Tone", color = "Color" }
     @State private var previews: [String: UIImage] = [:]
@@ -78,7 +81,10 @@ struct PhotoView: View {
     var body: some View {
         VStack(spacing: 16) {
             Group {
-                if let image { Image(uiImage: image).resizable().scaledToFit() } else { ProgressView() }
+                if let image { Image(uiImage: image).resizable().scaledToFit() }
+                else if missing { ContentUnavailableView("Can't open this photo", systemImage: "exclamationmark.triangle",
+                                                         description: Text("Its original file is missing or unreadable.")) }
+                else { ProgressView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -104,10 +110,13 @@ struct PhotoView: View {
         .padding()
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button { Task { await export() } } label: {
+                Menu {
+                    Button { Task { await export(share: false) } } label: { Label("Save to Photos", systemImage: "photo.badge.arrow.down") }
+                    Button { Task { await export(share: true) } } label: { Label("Share…", systemImage: "square.and.arrow.up") }
+                } label: {
                     if exporting { ProgressView() } else { Image(systemName: "square.and.arrow.up") }
                 }
-                .disabled(exporting)
+                .disabled(exporting || missing)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
@@ -136,11 +145,16 @@ struct PhotoView: View {
         }
         .task {
             recipe = library.recipe(id)
-            let url = library.raw(id), crop = recipe.crop
+            let url = library.raw(id), r = recipe
+            if r.shutterLook != nil {
+                shutterImage = UIImage(contentsOfFile: Look.shutterURL(for: url).path)
+                if r.usesShutterLook { image = shutterImage }
+            }
             let loaded = await Task.detached(priority: .userInitiated) { () -> (CIImage, Look.Analysis)? in
                 let t0 = Date()
-                guard let b = Look.decode(url, crop: crop, maxSide: 1600).flatMap(Look.materialize) else { return nil }
-                let a = Look.analyze(b, subject: true)
+                guard let (base, matchedAnalysis) = Look.photo(url, recipe: r, maxSide: 1600),
+                      let b = Look.materialize(base) else { return nil }
+                let a = matchedAnalysis ?? Look.analyze(b, subject: true)
                 #if DEBUG
                 diag.info("editor load \(Date().timeIntervalSince(t0), format: .fixed(precision: 2))s \(Look.decodeReport(b), privacy: .public) mem \(Look.footprintMB(), format: .fixed(precision: 0))MB")
                 #endif
@@ -148,10 +162,12 @@ struct PhotoView: View {
             }.value
             base = loaded?.0
             analysis = loaded?.1
+            missing = loaded == nil
             await render()
             await renderPreviews()
         }
         .onChange(of: recipe) { Task { await render() } }
+        .sheet(item: $shareURL) { ShareSheet(url: $0) }
         .onDisappear {
             guard !deleted else { return }
             let r = recipe
@@ -198,7 +214,7 @@ struct PhotoView: View {
 
     private func renderPreviews() async {
         guard let base, let analysis else { return }
-        let crop = recipe.crop, base0 = recipe.baseExposure
+        let crop = recipe.crop, base0 = recipe.baseExposure, match = recipe.previewMatch
         previews = await Task.detached(priority: .utility) {
             let s = 160 / max(base.extent.width, base.extent.height)
             let small = base.transformed(by: CGAffineTransform(scaleX: s, y: s))
@@ -206,6 +222,7 @@ struct PhotoView: View {
             for f in Filter.all {
                 var r = Recipe(filter: f.id, crop: crop)
                 r.baseExposure = base0
+                r.previewMatch = match
                 out[f.id] = Look.uiImage(Look.apply(r, to: small, analysis: analysis))
             }
             return out
@@ -215,7 +232,7 @@ struct PhotoView: View {
     /// One render in flight at a time, always of the *latest* recipe. A slider fires dozens of changes per second;
     /// rendering each one queued them up and the photo crawled through stale values for many seconds.
     private func render() async {
-        guard !rendering, let base else { return }
+        guard !rendering else { return }
         rendering = true
         defer { rendering = false }
         var r: Recipe
@@ -223,25 +240,46 @@ struct PhotoView: View {
             r = recipe
             let a = analysis
             let t0 = Date()
-            image = await Task.detached(priority: .userInitiated) { Look.uiImage(Look.apply(r, to: base, analysis: a)) }.value
+            if r.usesShutterLook, let shutterImage {
+                image = shutterImage
+            } else if let base {
+                image = await Task.detached(priority: .userInitiated) { Look.uiImage(Look.apply(r, to: base, analysis: a)) }.value
+            } else {
+                return
+            }
             #if DEBUG
             diag.debug("slider render \(Date().timeIntervalSince(t0) * 1000, format: .fixed(precision: 0))ms exposure \(r.exposure)")
             #endif
         } while r != recipe
+        if !deleted { library.store(r, for: id) } // settled: keep the edit even if the app is closed now
     }
 
-    private func export() async {
+    /// Export the same appearance as the editor with the original's EXIF/GPS.
+    /// The original is only read, never written.
+    private func export(share: Bool) async {
         exporting = true
         defer { exporting = false }
         let r = recipe, url = library.raw(id)
+        guard FileManager.default.fileExists(atPath: url.path) else { message = "This photo's original file is missing."; return }
         let t0 = Date()
         let data = await Task.detached(priority: .userInitiated) {
-            Look.decode(url, crop: r.crop).flatMap {
-                Look.jpeg(Look.apply(r, to: $0).settingProperties(Look.exportProperties(source: url, recipe: r)), quality: 0.95)
+            autoreleasepool {
+                Look.renderPhoto(url, recipe: r).flatMap { image in
+                    Look.jpeg(image.settingProperties(Look.exportProperties(source: url, recipe: r)), quality: 0.95)
+                }
             }
         }.value
         diag.info("export \(Date().timeIntervalSince(t0), format: .fixed(precision: 2))s \(data?.count ?? 0)B mem \(Look.footprintMB(), format: .fixed(precision: 0))MB")
-        guard let data else { message = "Couldn't render this photo."; return }
+        guard let data else { message = "Couldn't render this photo. Try again; if it keeps failing, restart the app."; return }
+        if share {
+            let file = Library.exportDir.appending(path: "bettercam-\(id).jpg")
+            do {
+                try FileManager.default.createDirectory(at: Library.exportDir, withIntermediateDirectories: true)
+                try data.write(to: file, options: .atomic)
+                shareURL = file
+            } catch { message = "Couldn't prepare the photo for sharing: \(error.localizedDescription)" }
+            return
+        }
 
         let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         guard status == .authorized || status == .limited else {
@@ -260,3 +298,14 @@ struct PhotoView: View {
 }
 
 private let diag = Logger(subsystem: "bettercam", category: "diag")
+
+extension URL: @retroactive Identifiable { public var id: String { absoluteString } }
+
+/// System share sheet for the rendered JPEG (AirDrop, Messages, Save to Files…).
+struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
+}

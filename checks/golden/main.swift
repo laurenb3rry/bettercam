@@ -41,6 +41,8 @@ func load(_ url: URL, maxSide: CGFloat?) -> (CIImage, Look.Analysis, Double) {
 
 // MARK: - Golden set: Natural Reference must not move
 
+/// GOLDEN_LOOK=<filter id> checks a look other than Natural Reference (Phase 5: the five approved looks are frozen too).
+let look = Filter.named(ProcessInfo.processInfo.environment["GOLDEN_LOOK"] ?? "naturalReference")
 if cmd == "golden" {
     let mode = args.removeFirst(), json = URL(fileURLWithPath: args.removeFirst())
     var stored = (try? Data(contentsOf: json)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: [[Double]]] } ?? [:]
@@ -48,7 +50,7 @@ if cmd == "golden" {
     for path in args {
         let url = URL(fileURLWithPath: path), key = url.lastPathComponent
         let (base, a, e) = load(url, maxSide: 600)
-        var g = Filter.naturalReference.grade; g.exposure += e
+        var g = look.grade; g.exposure += e
         let o = labPixels(Look.apply(g, to: base, analysis: a))
         var tiles: [[Double]] = []
         for ty in 0..<6 { for tx in 0..<6 {
@@ -65,7 +67,7 @@ if cmd == "golden" {
             let dl = r[0] - t[0], da = r[1] - t[1], db = r[2] - t[2]
             d = max(d, (dl * dl + da * da + db * db).squareRoot())
         }
-        print(d <= 0.5 ? "ok  " : "FAIL", "\(key): Natural Reference max tile ΔE \(String(format: "%.3f", d)) (≤ 0.5)")
+        print(d <= 0.5 ? "ok  " : "FAIL", "\(key): \(look.name) max tile ΔE \(String(format: "%.3f", d)) (≤ 0.5)")
         if d > 0.5 { failed = true }
     }
     if mode == "write" {
