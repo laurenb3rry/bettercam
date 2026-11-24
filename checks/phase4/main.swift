@@ -143,7 +143,7 @@ let tAnalyze = Date().timeIntervalSince(t0)
 let start = Look.startingExposure(url, captured: true)
 func globalOnly(_ g: Grade) -> Grade { var g = g; g.faceLift = 0; g.backgroundTone = 0; g.skinChromaLocal = 1; return g }
 
-let cands = Filter.phase4
+let cands = [Filter.riviera, .sunStudy, .alpine, .afterHours] // the Phase 4 candidates, promoted 2026-11-19
 let old: [String: Filter] = ["rivieraP4": .riviera, "sunStudyP4": .sunStudy, "alpineP4": .alpine, "afterHoursP4": .afterHours]
 let guideImg = base.applyingFilter("CILinearToSRGBToneCurve")
 let plan = Look.selectivePlan(cands[0].grade, analysis, guide: guideImg)
@@ -188,7 +188,7 @@ for c in cands + [Filter.editorial] {
         preLines.append(String(format: "selective %@: face lift %+.2f EV, background %+.2f EV, skin region %@", c.name as NSString, p.lift, -p.background, p.skin != nil ? "yes" : "no (face ellipse)"))
     }
 }
-let ev = analysis.sceneEV, night = Filter.afterHoursP4.grade.night!
+let ev = analysis.sceneEV, night = Filter.afterHours.grade.night!
 preLines.append(String(format: "scene EV %@ → After Hours night share %.2f", ev.map { String(format: "%.1f", $0) } ?? "n/a", ev.map { ((1 - Grade.smooth(night.darkEV, night.lightEV, $0)) * 4).rounded() / 4 } ?? 0))
 var lines = [String(format: "%@  light: %@ (T %.2f G %.2f conf %.2f)  faces %d  mask trusted %@  subjectGap %.2f  faceGap %.2f  decode %.2fs analyze %.2fs",
                     url.lastPathComponent as NSString, Look.lightMood(analysis) as NSString, analysis.illuminant.T, analysis.illuminant.G,

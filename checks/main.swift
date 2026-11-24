@@ -96,6 +96,7 @@ for f in Filter.all + Filter.retired where !f.grade.print.on {
     var g = f.grade; g.bloom = 0
     let n = render([[0.02, 0.02, 0.02], [0.18, 0.18, 0.18], [1.2, 1.2, 1.2]], g)
     check(n.allSatisfy { chroma($0) < 0.012 }, "\(f.name): neutrals stay neutral (max chroma \(String(format: "%.4f", n.map(chroma).max()!)))")
+    guard !g.monochrome else { continue }
     // red light stays red (After Hours' red door; any look): dim vs bright saturated red keep their hue
     let rr = render([[0.18, 0.02, 0.02], [2.5, 0.28, 0.28]], g).map(hue)
     check(abs(rr[1] - rr[0]) < 12, "\(f.name): red light keeps its hue (drift \(String(format: "%.1f", rr[1] - rr[0]))°)")

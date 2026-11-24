@@ -32,17 +32,19 @@ func fit(_ img: CIImage, _ side: CGFloat) -> CIImage {
     img.applyingFilter("CILanczosScaleTransform", parameters: ["inputScale": side / max(img.extent.width, img.extent.height)])
 }
 
-/// Source → (base image, analysis, starting exposure). DNG: the app's decode + Library's starting exposure. HEIC/JPEG: look only.
+/// Source → (base image, analysis, starting exposure): the app's engine 2 development (Look.photo: guide-size analysis with
+/// local tone development) + Library's starting exposure. Engine 1 references are kept as `<look>-engine1.json`.
 func load(_ url: URL, maxSide: CGFloat?) -> (CIImage, Look.Analysis, Double) {
-    let base = Look.decode(url, maxSide: maxSide)!
-    let a = Look.analyze(base, subject: true)
+    let (base, a) = Look.photo(url, recipe: Recipe(), maxSide: maxSide)!
     return (base, a, Look.startingExposure(url, captured: true))
 }
 
 // MARK: - Golden set: Natural Reference must not move
 
 /// GOLDEN_LOOK=<filter id> checks a look other than Natural Reference (Phase 5: the five approved looks are frozen too).
-let look = Filter.named(ProcessInfo.processInfo.environment["GOLDEN_LOOK"] ?? "naturalReference")
+let environment = ProcessInfo.processInfo.environment
+let look = Filter.named(environment["GOLDEN_LOOK"] ?? "naturalReference",
+                        revision: environment["GOLDEN_LOOK_REVISION"].flatMap(Int.init) ?? 0)
 if cmd == "golden" {
     let mode = args.removeFirst(), json = URL(fileURLWithPath: args.removeFirst())
     var stored = (try? Data(contentsOf: json)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: [[Double]]] } ?? [:]

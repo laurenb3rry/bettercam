@@ -4,9 +4,8 @@ import SwiftUI
 
 /// Bayer by default, with ProRAW options where supported and HEIC on cameras without RAW.
 /// The viewfinder is the video feed run through the same Look engine as the photo, with the current filter.
-final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
-    /// One zoom button. 2× is the main lens with a center crop applied when developing (Bayer RAW requires zoom 1.0 at
-    /// capture; ProRAW shoots that stop at 48 MP so the crop keeps 12 MP).
+final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCapturePhotoOutputReadinessCoordinatorDelegate {
+    /// A native lens or a 2× view of the main sensor. Physical-input modes apply the crop during development.
     struct Stop: Identifiable, Equatable {
         let id: String
         let label: String
@@ -17,48 +16,41 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     }
 
     /// `exposure`: the viewfinder's exposure offset at the press (render-only, becomes the recipe's Exposure slider).
+    /// The viewfinder snapshot is only used while the original's thumbnail develops.
     struct Shot {
-        let data: Data; let ext: String; let crop: Double; let filter: String; let exposure: Double
-        let preview: PreviewSample?
-        let metadata: String
-        let canMatch: Bool
-        let previewDelay: Double
+        let ext: String; let crop: Double; let filter: String; let exposure: Double
+        let grainSeed: UInt32?
+        let captureID: Int64
+        let delivered: TimeInterval
+        let preview: CGImage?
     }
 
+    /// One filtered viewfinder frame, tagged with the lens/mode generation it was rendered for.
     struct PreviewSample {
-        let input: CIImage?
-        let analysis: Look.Analysis
-        let pts: Double
-        let received: Date
-        let generation: Int
-        let filter: String
-        let exposure: Double
-        let metadata: String
         let rendered: CGImage
-        var grainSeed: UInt32? = nil
+        let generation: Int
     }
 
     enum Mode: String, CaseIterable, Identifiable {
-        case proRAW12 = "ProRAW 12MP", proRAW48 = "ProRAW 48MP"
-        case bayer = "Bayer RAW 12MP", bayerFixed = "Bayer RAW 12MP fixed −1EV"
+        case proRAW12 = "ProRAW 12MP", proRAW48 = "ProRAW 48MP", bayer = "Bayer RAW 12MP"
         var id: String { rawValue }
         var proRAW: Bool { self == .proRAW12 || self == .proRAW48 }
-        /// What the app shoots unless the user picked a format (the chip menu, remembered). Bayer: the only source validated
-        /// in BetterCam on the phone so far. Becomes .proRAW12 once the device self-test passes (research/15-bettercam-final.md).
-        static let standard = Mode.bayer
+        /// What the app shoots unless the user picked a format (the chip menu, remembered).
+        static let standard = Mode.proRAW12
     }
 
     let session = AVCaptureSession()
     @Published private(set) var stops: [Stop] = []      // back lenses
     @Published private(set) var front: Stop?
     @Published private(set) var current: Stop?
-    @Published private(set) var busy = false            // too many shots still processing: shutter waits
+    @Published private(set) var selected: Stop?
+    @Published private(set) var busy = true            // too many shots still processing: shutter waits
     @Published private(set) var flashAvailable = false
     @Published private(set) var format = ""             // what the next shot will be, e.g. "ProRAW 12"
     @Published private(set) var shutterCount = 0        // bumps at exposure: the UI blinks
     @Published private(set) var permissionDenied = false
     @Published var error: String?
-    var onCapture: ((Shot) -> Void)?
+    var onCapture: ((Shot, Data) async -> Void)?
     /// Filtered viewfinder frames (called on the video queue).
     var onFrame: ((PreviewSample) -> Void)?
     /// Filter id for the live preview and the next capture. Set from the main thread, read on the video queue.
@@ -79,19 +71,33 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     var mode: Mode {
         get { lock.withLock { _mode } }
         set {
-            lock.withLock { _mode = newValue }
             queue.async {
+                self.lock.withLock { self._mode = newValue }
                 guard let stop = self.active else { return }
-                self.session.beginConfiguration()
-                self.configureRaw(stop.device)
-                self.session.commitConfiguration()
-                self.prepare(stop)
+                self.use(stop, formatChanged: true)
             }
         }
     }
 
     private let output = AVCapturePhotoOutput()
-    private let queue = DispatchQueue(label: "camera")
+    private let queue = DispatchQueue(label: "camera", qos: .userInitiated)
+    private lazy var readiness = AVCapturePhotoOutputReadinessCoordinator(photoOutput: output)
+    private var writing: Set<Int64> = []
+    private var sensorTimes: [Int64: TimeInterval] = [:]
+    private var previewDrops = 0
+    private var previewReport = ProcessInfo.processInfo.systemUptime
+    private var previewPending = false
+    private var latestPreview: (image: CGImage, filter: String, exposure: Double, time: TimeInterval)?
+    private var shutterPreviews: [Int64: CGImage] = [:]
+    private var selection = 0
+    private var cropDeviceID: String?
+    private var virtualRear: AVCaptureDevice?
+    private var virtualZooms: [String: CGFloat] = [:]
+    private var usesVirtualRear = false
+    private var zoomStarted: TimeInterval?
+    #if DEBUG
+    private var saveReferenceFrame = ProcessInfo.processInfo.arguments.contains("-color-reference-frame")
+    #endif
     private let video = AVCaptureVideoDataOutput()
     private let videoQueue = DispatchQueue(label: "camera.video", qos: .userInteractive)
     private let analysisQueue = DispatchQueue(label: "camera.analysis", qos: .utility)
@@ -106,14 +112,11 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     private var _bias: Float = 0     // exposure target bias in effect; the viewfinder undoes it like decode does
     private var _analysis: Look.Analysis?
     private var generation = 0
-    private var shownPreview: PreviewSample?
-    private var previewDevice: AVCaptureDevice?
     private var pending: [Int64: Pending] = [:] // per shot, by settings.uniqueID: back-to-back shots can't swap filters
     // camera queue
     private var input: AVCaptureDeviceInput?
     private var active: Stop?
-    private var defaultDims: CMVideoDimensions? // the output's size before any mode changed it (Bayer keeps it)
-    private var dims12: CMVideoDimensions?      // ProRAW sizes on this lens (nil: not available)
+    private var dims12: CMVideoDimensions?
     private var dims48: CMVideoDimensions?
     private var proRAWActive = false
     private var biasVote = 0, biasStreak = 0
@@ -125,54 +128,26 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     private var lastTrusted: Look.Analysis?  // keeps the pass alive through a few uncertain frames instead of flickering
 
     /// Viewfinder frame size, long side in pixels: about a phone screen's 3:4 area (1206–1320 pt wide × 3).
-    private static let previewSide: CGFloat = 1920
+    private static let previewSide: CGFloat = 1080
     /// Standard captures allowed in flight at once.
     private static let maxInFlight = 3
 
     private struct Pending {
         let crop: Double, filter: String, exposure: Double, mode: Mode, proRAW: Bool, size48: Bool, label: String
-        let pressed: Date
-        let preview: PreviewSample?
+        let pressed: TimeInterval; let requested: TimeInterval
+        let request: String
+        let grainSeed: UInt32?
+        let generation: Int
     }
 
     func didDisplay(_ sample: PreviewSample) -> Bool {
-        lock.withLock {
-            guard sample.generation == generation else { return false }
-            shownPreview = sample
-            return true
-        }
-    }
-
-    private func resetPreview() {
-        lock.withLock {
-            generation += 1
-            shownPreview = nil
-            _analysis = nil
-        }
-    }
-
-    static let parityDiagnostics = {
-        #if DEBUG
-        CommandLine.arguments.contains("-preview-parity") || CommandLine.arguments.contains("-selftest")
-        #else
-        false
-        #endif
-    }()
-
-    static func videoMetadata(_ buffer: CVPixelBuffer, sb: CMSampleBuffer, device: AVCaptureDevice?, bias: Double) -> String {
-        let tags = [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey]
-            .map { CVBufferCopyAttachment(buffer, $0, nil).map(String.init(describing:)) ?? "?" }
-        let exif = CMGetAttachment(sb, key: kCGImagePropertyExifDictionary, attachmentModeOut: nil)
-        let wb = device.map { $0.temperatureAndTintValues(for: $0.deviceWhiteBalanceGains) }
-        let gains = device?.deviceWhiteBalanceGains
-        return "videoPTS=\(sb.presentationTimeStamp.seconds) \(fourCC(CVPixelBufferGetPixelFormatType(buffer))) " +
-            "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) colorTags=\(tags) " +
-            "bias=\(bias) deviceISO=\(device?.iso ?? 0) deviceShutter=\(device?.exposureDuration.seconds ?? 0) " +
-            "wb=\(String(describing: wb)) gains=\(String(describing: gains)) exif=\(String(describing: exif))"
+        lock.withLock { previewPending = false; return sample.generation == generation }
     }
 
     func start(preferred: String, mode: Mode) {
         lock.withLock { _mode = mode }
+        readiness.delegate = self
+        Self.log.notice("render revision \(Look.version) recipe engine \(Recipe.engine)")
         observeSession()
         AVCaptureDevice.requestAccess(for: .video) { ok in
             guard ok else {
@@ -188,12 +163,24 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         queue.async { if self.input != nil, !self.session.isRunning { self.session.startRunning() } }
     }
 
-    func select(_ stop: Stop) { queue.async { self.use(stop) } }
+    func select(_ stop: Stop) {
+        guard selected != stop else { return }
+        selected = stop
+        let tap = ProcessInfo.processInfo.systemUptime
+        let request = lock.withLock {
+            selection += 1
+            return selection
+        }
+        queue.async {
+            guard self.lock.withLock({ self.selection == request }) else { return }
+            self.use(stop, request: request, tap: tap)
+        }
+    }
 
     /// Flip between the back camera (back to 1×) and the selfie camera.
     func flip() {
-        guard let current else { return }
-        if current.isFront {
+        guard let stop = selected ?? current else { return }
+        if stop.isFront {
             if let wide = stops.first(where: { $0.label == "1×" }) ?? stops.first { select(wide) }
         } else if let front {
             select(front)
@@ -202,16 +189,16 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
 
     /// `flash`: the LED, for After Hours-style shots (doc §5.3: flash is a capture feature, not a look).
     func capture(flash: Bool = false) {
-        let pressed = Date()
-        let (shown, filter, exposure) = lock.withLock { (shownPreview, _filter, _exposure) }
+        let pressed = ProcessInfo.processInfo.systemUptime
+        let (filter, exposure) = lock.withLock { (_filter, _exposure) }
         queue.async {
             guard let stop = self.active, self.session.isRunning else { return }
             guard !self.lock.withLock({ self.captureBusy() }),
-                  !self.wants48(stop) || self.lock.withLock({ self.pending.isEmpty }) else { return }
+                  !self.wants48(stop) || self.lock.withLock({ self.pending.isEmpty && self.writing.isEmpty }) else { return }
             if let free = Self.freeSpaceMB(), free < 300 {
                 return self.fail("Storage is almost full (\(free) MB free). Free some space to keep shooting.")
             }
-            self.shoot(stop, flash: flash, pressed: pressed, shown: shown, filter: filter, exposure: exposure)
+            self.shoot(stop, flash: flash, pressed: pressed, filter: filter, exposure: exposure)
         }
     }
 
@@ -233,7 +220,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
 
     // MARK: - Private (camera queue)
 
-    private func shoot(_ stop: Stop, flash: Bool, pressed: Date, shown: PreviewSample?, filter: String, exposure: Double) {
+    private func shoot(_ stop: Stop, flash: Bool, pressed: TimeInterval, filter: String, exposure: Double) {
         let size48 = wants48(stop)
         let settings = makeSettings(stop, size48: size48)
         if flash, output.supportedFlashModes.contains(.on) { settings.flashMode = .on }
@@ -241,28 +228,47 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             if conn.isVideoRotationAngleSupported(90) { conn.videoRotationAngle = 90 }
             if conn.isVideoMirroringSupported { conn.automaticallyAdjustsVideoMirroring = false; conn.isVideoMirrored = stop.isFront }
         }
-        let generation = lock.withLock { self.generation }
-        let preview = settings.flashMode == .off && shown?.generation == generation ? shown : nil
-        if (preview?.filter ?? filter) == Filter.leicaM6.id {
-            lock.withLock { grainSeed = UInt32.random(in: .min ... .max) }
-        }
-        let p = Pending(crop: stop.crop, filter: preview?.filter ?? filter, exposure: preview?.exposure ?? exposure,
-                        mode: mode, proRAW: settingsAreProRAW(settings),
-                        size48: size48, label: stop.label, pressed: pressed, preview: preview)
-        let busy = lock.withLock { pending[settings.uniqueID] = p; return captureBusy() }
-        DispatchQueue.main.async { self.busy = busy }
+        // the seed the viewfinder showed, so the photo's grain is the pattern composed with; a fresh one for the next shot
+        let seed: UInt32? = Filter.named(filter).grade.grain > 0 ? lock.withLock {
+            defer { grainSeed = UInt32.random(in: .min ... .max) }
+            return grainSeed
+        } : nil
+        let dimensions = settings.maxPhotoDimensions
+        let request = "mode=\(mode.rawValue) requestedMax=\(dimensions.width)x\(dimensions.height) requestedFourCC=\(Self.fourCC(settings.rawPhotoPixelFormatType)) camera=\(stop.device.deviceType.rawValue)"
+        let requested = ProcessInfo.processInfo.systemUptime
+        let p = Pending(crop: usesVirtualRear ? 1 : stop.crop, filter: filter, exposure: exposure, mode: mode, proRAW: settingsAreProRAW(settings),
+                        size48: size48, label: stop.label, pressed: pressed, requested: requested, request: request, grainSeed: seed, generation: lock.withLock { generation })
+        lock.withLock { pending[settings.uniqueID] = p }
+        readiness.startTrackingCaptureRequest(using: settings)
+        Self.log.info("capture \(settings.uniqueID) tap to request \((requested - pressed) * 1000) ms")
         output.capturePhoto(with: settings, delegate: self)
+        updateBusy()
     }
 
-    // A single 48 MP ProRAW capture can use more than 1 GB inside the camera pipeline.
+    func readinessCoordinator(_ coordinator: AVCapturePhotoOutputReadinessCoordinator,
+                              captureReadinessDidChange captureReadiness: AVCapturePhotoOutput.CaptureReadiness) {
+        updateBusy()
+    }
+
+    private func updateBusy() {
+        DispatchQueue.main.async {
+            let state = self.readiness.captureReadiness
+            let busy = state == .sessionNotRunning || state == .notReadyWaitingForCapture
+                || self.lock.withLock { self.captureBusy() }
+            if self.busy != busy { self.busy = busy }
+        }
+    }
+
+    // Carry the bound through original persistence so repeated taps cannot queue unbounded DNG buffers.
     private func captureBusy() -> Bool {
-        pending.count >= Self.maxInFlight || pending.values.contains(where: \.size48)
+        Set(pending.keys).union(writing).count >= Self.maxInFlight || pending.values.contains(where: \.size48)
+            || (writing.count > 0 && _mode == .proRAW48)
     }
 
     private func settingsAreProRAW(_ s: AVCapturePhotoSettings) -> Bool { AVCapturePhotoOutput.isAppleProRAWPixelFormat(s.rawPhotoPixelFormatType) }
 
     /// ProRAW at 48 MP: when asked for, and for crop stops (a 2× crop of 12 MP would keep only 3 MP).
-    private func wants48(_ stop: Stop) -> Bool { proRAWActive && dims48 != nil && (mode == .proRAW48 || stop.crop > 1) }
+    private func wants48(_ stop: Stop) -> Bool { proRAWActive && dims48 != nil && (!usesVirtualRear && (mode == .proRAW48 || stop.crop > 1)) }
 
     /// One RAW request. Also used to pre-allocate the pipeline (setPreparedPhotoSettingsArray), so the first shot after
     /// a mode/lens change doesn't pay setup time.
@@ -274,17 +280,18 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             // ponytail: only cameras with neither Bayer RAW nor ProRAW land here
             let s = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
             s.photoQualityPrioritization = .balanced
+            if let dims12 { s.maxPhotoDimensions = dims12 }
             return s
         }
         let settings = AVCapturePhotoSettings(rawPixelFormatType: raw)
         if AVCapturePhotoOutput.isAppleProRAWPixelFormat(raw) {
             // Only ever ask for the output's own values (AVFoundation throws above them): its max priority (.quality:
             // multi-frame fusion) and one of the sizes configureRaw found in the format's list.
-            settings.photoQualityPrioritization = output.maxPhotoQualityPrioritization
-            if let d = size48 ? dims48 : dims12 { settings.maxPhotoDimensions = d }
+            settings.photoQualityPrioritization = size48 ? output.maxPhotoQualityPrioritization : .balanced
         } else {
             settings.photoQualityPrioritization = .speed // Required for Bayer by AVCapturePhotoOutput.
         }
+        if let d = size48 ? dims48 : dims12 { settings.maxPhotoDimensions = d }
         Self.log.info("request \(self.mode.rawValue, privacy: .public) \(stop.label, privacy: .public) fmt=\(Self.fourCC(raw), privacy: .public) max=\(settings.maxPhotoDimensions.width)x\(settings.maxPhotoDimensions.height) prio=\(settings.photoQualityPrioritization.rawValue) bias=\(stop.device.exposureTargetBias)")
         return settings
     }
@@ -308,6 +315,19 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         }
         if let tele { stops.append(Stop(id: tele.uniqueID, label: "\(Int(teleZoom.rounded()))×", device: tele, crop: 1)) }
 
+        cropDeviceID = stops.first { $0.crop > 1 }?.device.uniqueID
+        virtualRear = AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back)
+            ?? AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back)
+            ?? AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back)
+        if let virtualRear {
+            let native = Dictionary(uniqueKeysWithValues: zip(virtualRear.constituentDevices.map(\.uniqueID),
+                [1] + virtualRear.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat($0.doubleValue) }))
+            for stop in stops {
+                if let factor = native[stop.device.uniqueID] {
+                    virtualZooms[stop.id] = factor * stop.crop
+                }
+            }
+        }
         let frontDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
         let front = frontDevice.map { Stop(id: $0.uniqueID, label: "1×", device: $0, crop: 1) }
 
@@ -315,7 +335,6 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         session.sessionPreset = .photo
         if session.canAddOutput(output) { session.addOutput(output) }
         video.alwaysDiscardsLateVideoFrames = true
-        video.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         video.setSampleBufferDelegate(self, queue: videoQueue)
         if session.canAddOutput(video) { session.addOutput(video) }
         session.commitConfiguration()
@@ -325,82 +344,137 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         session.startRunning()
     }
 
-    private func use(_ stop: Stop) {
-        if input?.device != stop.device {
-            guard let new = try? AVCaptureDeviceInput(device: stop.device) else { return fail("Couldn't open that camera.") }
+    private func use(_ stop: Stop, formatChanged: Bool = false, request: Int? = nil, tap: TimeInterval? = nil) {
+        guard active != stop || formatChanged else { return }
+        defer {
+            DispatchQueue.main.async {
+                if let request {
+                    guard self.lock.withLock({ self.selection == request }) else { return }
+                } else if self.selected != nil {
+                    return
+                }
+                self.selected = self.current
+            }
+        }
+        let zoom = mode == .proRAW12 ? virtualZooms[stop.id] : nil
+        let device = zoom.flatMap { _ in virtualRear } ?? stop.device
+        let switchingDevice = input?.device != device
+        if switchingDevice || formatChanged {
+            let new = switchingDevice ? try? AVCaptureDeviceInput(device: device) : input
+            guard let new else { return fail("Couldn't open that camera.") }
             session.beginConfiguration()
-            if let input { session.removeInput(input) }
-            if session.canAddInput(new) { session.addInput(new); input = new } else if let input { session.addInput(input) }
-            configureRaw(stop.device)
+            if switchingDevice {
+                if let input { session.removeInput(input) }
+                guard session.canAddInput(new) else {
+                    if let input, session.canAddInput(input) { session.addInput(input) }
+                    session.commitConfiguration()
+                    return fail("Couldn't open that camera.")
+                }
+                session.addInput(new)
+                input = new
+            }
+            // The main lens also supplies 2×. Keep its detailed feed configured across both stops.
+            video.automaticallyConfiguresOutputBufferDimensions = false
+            video.deliversPreviewSizedOutputBuffers = zoom != nil || stop.device.uniqueID != cropDeviceID
+            let format = video.availableVideoPixelFormatTypes.contains(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+                ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_32BGRA
+            video.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: format]
+            configureRaw(device, virtual: zoom != nil)
             session.commitConfiguration()
+            if zoom != nil, !proRAWActive {
+                virtualRear = nil
+                virtualZooms.removeAll()
+                return use(stop, formatChanged: true, request: request, tap: tap)
+            }
             // after commit, on the connection that actually runs: upright, and mirrored like a mirror for selfies.
             // (Set inside the configuration, the selfie camera's frames arrived unrotated.)
             if let c = video.connection(with: .video) {
                 if c.isVideoMirroringSupported { c.automaticallyAdjustsVideoMirroring = false; c.isVideoMirrored = stop.isFront }
                 if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
             }
-            let d = stop.device
+            let d = device
             if (try? d.lockForConfiguration()) != nil {
                 if d.isFocusModeSupported(.continuousAutoFocus) { d.focusMode = .continuousAutoFocus }
                 d.unlockForConfiguration()
             }
         }
-        // 2× blur: under the .photo preset the video output sends preview-sized frames (~screen size), and the 2× stop
-        // center-crops them, leaving ~half the screen's pixels to upscale. Full-resolution frames only there.
-        if video.deliversPreviewSizedOutputBuffers == (stop.crop > 1) {
-            session.beginConfiguration()
-            video.automaticallyConfiguresOutputBufferDimensions = false
-            video.deliversPreviewSizedOutputBuffers = stop.crop <= 1
-            session.commitConfiguration()
+        if let zoom, (try? device.lockForConfiguration()) != nil {
+            let target = min(max(zoom, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
+            device.videoZoomFactor = target
+            device.unlockForConfiguration()
         }
         active = stop
-        lock.withLock { _crop = stop.crop }
-        prepare(stop)
+        usesVirtualRear = zoom != nil
+        lock.withLock {
+            _crop = usesVirtualRear ? 1 : stop.crop
+            zoomStarted = tap
+            generation += 1
+            latestPreview = nil
+            if switchingDevice || formatChanged { _analysis = nil }
+        }
+        if switchingDevice || formatChanged {
+            setBias(device, initialBias())
+            prepareSettings(stop)
+        }
+        publishFormat(stop)
         let flash = output.supportedFlashModes.contains(.on)
         DispatchQueue.main.async { self.current = stop; self.flashAvailable = flash }
     }
 
-    /// After any lens/mode change: bias, prepared settings, and the format label.
-    private func prepare(_ stop: Stop) {
-        setBias(stop.device, initialBias())
-        lock.withLock { previewDevice = stop.device }
-        resetPreview()
-        var list = [makeSettings(stop, size48: wants48(stop))]
-        if proRAWActive, dims48 != nil, !wants48(stop) { list.append(makeSettings(stop, size48: true)) }
+    private func prepareSettings(_ stop: Stop) {
+        let bothSizes = !usesVirtualRear && mode != .proRAW48 && proRAWActive && dims48 != nil && stop.device.uniqueID == cropDeviceID
+        let list = bothSizes ? [makeSettings(stop, size48: false), makeSettings(stop, size48: true)]
+            : [makeSettings(stop, size48: wants48(stop))]
         output.setPreparedPhotoSettingsArray(list) { ok, err in
             if !ok { Self.log.error("prepare failed: \(err?.localizedDescription ?? "?", privacy: .public)") }
         }
-        let hasBayer = output.availableRawPhotoPixelFormatTypes.contains(where: AVCapturePhotoOutput.isBayerRAWPixelFormat)
-        let label = proRAWActive ? (wants48(stop) ? "ProRAW 48" : "ProRAW 12") : hasBayer ? "RAW" : "HEIC"
+    }
+
+    private func publishFormat(_ stop: Stop) {
+        let label = formatLabel(stop)
         DispatchQueue.main.async { self.format = label }
+    }
+
+    /// The chip: what the next shot actually delivers, in genuine pixels after any center crop. Megapixels are truncated
+    /// (8064×6048 = 48.8 MP is "48", the name everyone uses; rounding showed "ProRAW 49"). A crop or a missing size says so.
+    private func formatLabel(_ stop: Stop) -> String {
+        let hasBayer = output.availableRawPhotoPixelFormatTypes.contains(where: AVCapturePhotoOutput.isBayerRAWPixelFormat)
+        let size = proRAWActive ? (wants48(stop) ? dims48 : dims12) : dims12
+        let crop = usesVirtualRear ? 1 : stop.crop
+        let mp = size.map { Int(Double($0.width) * Double($0.height) / (crop * crop) / 1_000_000) }
+        let name = proRAWActive ? "ProRAW" : (hasBayer ? "RAW" : "HEIC")
+        var label = mp.map { "\(name) \($0)" } ?? name
+        if crop > 1 { label += " · crop" }
+        if mode == .proRAW48, proRAWActive, dims48 == nil { label += " · no 48 here" }
+        if mode.proRAW, !proRAWActive { label += " · no ProRAW here" }
+        return label
     }
 
     /// ProRAW unless the mode asks for Bayer or this camera has no ProRAW; then Bayer; HEIC only if neither exists.
     /// All of it inside the session configuration, before startRunning (Apple: else a reconfiguration at first capture).
-    private func configureRaw(_ d: AVCaptureDevice) {
+    private func configureRaw(_ d: AVCaptureDevice, virtual: Bool) {
         let mode = self.mode
-        output.isAppleProRAWEnabled = false
         let hasBayer = output.availableRawPhotoPixelFormatTypes.contains(where: AVCapturePhotoOutput.isBayerRAWPixelFormat)
-        if output.isAppleProRAWSupported, mode.proRAW || !hasBayer { output.isAppleProRAWEnabled = true }
+        let enableProRAW = output.isAppleProRAWSupported && (mode.proRAW || !hasBayer)
+        if output.isAppleProRAWEnabled != enableProRAW { output.isAppleProRAWEnabled = enableProRAW }
         proRAWActive = output.isAppleProRAWEnabled
             && output.availableRawPhotoPixelFormatTypes.contains(where: AVCapturePhotoOutput.isAppleProRAWPixelFormat)
         let dims = d.activeFormat.supportedMaxPhotoDimensions
         func mp(_ x: CMVideoDimensions) -> Int { Int(x.width) * Int(x.height) }
-        let fallbackDims = defaultDims ?? output.maxPhotoDimensions
-        defaultDims = fallbackDims
-        dims12 = nil; dims48 = nil
-        if proRAWActive {
-            dims12 = dims.filter { mp($0) <= 14_000_000 }.max { mp($0) < mp($1) }
-            dims48 = dims.filter { mp($0) >= 40_000_000 }.max { mp($0) < mp($1) }
-            if let big = dims48 ?? dims12 ?? dims.max(by: { mp($0) < mp($1) }) { output.maxPhotoDimensions = big }
-            output.maxPhotoQualityPrioritization = .quality
-        } else if output.maxPhotoDimensions.width != fallbackDims.width,
-                  dims.contains(where: { $0.width == fallbackDims.width && $0.height == fallbackDims.height }) {
-            output.maxPhotoDimensions = fallbackDims // Bayer: exactly the validated pre-ProRAW path
+        dims12 = dims.filter { mp($0) <= 14_000_000 }.max { mp($0) < mp($1) }
+            ?? dims.min { mp($0) < mp($1) }
+        dims48 = proRAWActive && !virtual ? dims.filter { mp($0) >= 40_000_000 }.max { mp($0) < mp($1) } : nil
+        if let maximum = dims48 ?? dims12, (output.maxPhotoDimensions.width != maximum.width || output.maxPhotoDimensions.height != maximum.height) {
+            output.maxPhotoDimensions = maximum
         }
+        let priority: AVCapturePhotoOutput.QualityPrioritization = dims48 != nil ? .quality : .balanced
+        if output.maxPhotoQualityPrioritization != priority { output.maxPhotoQualityPrioritization = priority }
         // overlapping captures (press again while the last one is processing), same quality; off where unsupported
         if output.isZeroShutterLagSupported { output.isZeroShutterLagEnabled = true }
-        output.isResponsiveCaptureEnabled = output.isResponsiveCaptureSupported
+        if output.isResponsiveCaptureSupported { output.isResponsiveCaptureEnabled = true }
+        if output.isFastCapturePrioritizationSupported, output.isFastCapturePrioritizationEnabled != virtual {
+            output.isFastCapturePrioritizationEnabled = virtual
+        }
         if mode.proRAW, !proRAWActive {
             Self.log.error("fallback: no ProRAW on \(d.localizedName, privacy: .public), shooting \(hasBayer ? "Bayer RAW" : "HEIC", privacy: .public)")
         }
@@ -421,8 +495,8 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     private var shootsBayer: Bool {
         !proRAWActive && output.availableRawPhotoPixelFormatTypes.contains(where: AVCapturePhotoOutput.isBayerRAWPixelFormat)
     }
-    /// Bayer by choice or as the ProRAW fallback; `.bayerFixed` keeps the old fixed −1 EV for comparison.
-    private var adaptiveBias: Bool { shootsBayer && mode != .bayerFixed }
+    /// Bayer by choice or as the ProRAW fallback.
+    private var adaptiveBias: Bool { shootsBayer }
 
     /// Bayer only, from the running viewfinder analysis (never at the press: zero shutter lag). The 8-bit video clips
     /// 1.2–2.3 stops before the RAW does (research/11 §5, Look.analyze), so video statistics are a conservative proxy:
@@ -480,7 +554,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         DispatchQueue.main.async { self.error = message }
     }
 
-    private static let log = Logger(subsystem: "bettercam", category: "capture")
+    fileprivate static let log = Logger(subsystem: "bettercam", category: "capture")
 
     /// EV100 from a video frame's EXIF attachment (same formula as Look.sceneEV for files); nil if the frame has none.
     private static func sceneEV(_ sb: CMSampleBuffer) -> Double? {
@@ -498,16 +572,36 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     // MARK: - AVCapturePhotoCaptureDelegate
 
     func photoOutput(_ output: AVCapturePhotoOutput, willCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        lock.withLock {
+            let id = resolvedSettings.uniqueID
+            if !resolvedSettings.isFlashEnabled, let request = pending[id], let preview = latestPreview,
+               request.generation == generation, request.filter == preview.filter, request.exposure == preview.exposure,
+               ProcessInfo.processInfo.systemUptime - preview.time < 0.25 {
+                shutterPreviews[id] = preview.image
+            }
+        }
         DispatchQueue.main.async { self.shutterCount += 1 }
-        if let p = lock.withLock({ pending[resolvedSettings.uniqueID] }) {
-            Self.log.info("shutter lag \(Date().timeIntervalSince(p.pressed) * 1000, format: .fixed(precision: 0))ms")
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didCapturePhotoFor resolvedSettings: AVCaptureResolvedPhotoSettings) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let id = resolvedSettings.uniqueID
+        if let request = lock.withLock({ sensorTimes[id] = now; return pending[id] }) {
+            Self.log.info("capture \(id) request to sensor callback \((now - request.requested) * 1000) ms")
         }
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        guard let p = lock.withLock({ pending[photo.resolvedSettings.uniqueID] }) else { return }
+        let id = photo.resolvedSettings.uniqueID
+        let callback = ProcessInfo.processInfo.systemUptime
+        let (request, sensor, preview) = lock.withLock { (pending[id], sensorTimes[id], shutterPreviews.removeValue(forKey: id)) }
+        guard let p = request else { return }
         guard error == nil, let data = photo.fileDataRepresentation() else {
             return fail("The photo couldn't be captured: \(error?.localizedDescription ?? "no image data"). Try again.")
+        }
+        let delivered = ProcessInfo.processInfo.systemUptime
+        if let sensor {
+            Self.log.info("capture \(id) sensor callback to processing callback \((callback - sensor) * 1000) ms, DNG serialization \((delivered - callback) * 1000) ms")
         }
         // what the sensor actually delivered, never what was requested
         let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any]
@@ -519,15 +613,15 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             ?? (dng.map { $0["CFAPlaneColor"] == nil } ?? p.proRAW))
         func s(_ v: Any?) -> String { v.map { String(describing: $0).filter { !$0.isWhitespace } } ?? "?" }
         let line = [
-            "capture", p.mode.rawValue, p.label, "lens=" + s(exif?[kCGImagePropertyExifLensModel as String]),
+            "capture", p.request, p.label, "lens=" + s(exif?[kCGImagePropertyExifLensModel as String]),
             "raw=\(photo.isRawPhoto)", "proRAW=\(isProRAW)", "fourCC=\(format.map(Self.fourCC) ?? "?")",
-            "\(dims.width)x\(dims.height)", "crop=\(p.crop)", "photoPTS=\(photo.timestamp.seconds)",
+            "resolved=\(dims.width)x\(dims.height)", "crop=\(p.crop)", "photoPTS=\(photo.timestamp.seconds)",
             String(format: "%.1fMP", mp / (p.crop * p.crop)),
             "ISO=" + s(exif?[kCGImagePropertyExifISOSpeedRatings as String]), "t=" + s(exif?[kCGImagePropertyExifExposureTime as String]),
             "bias=" + s(exif?[kCGImagePropertyExifExposureBiasValue as String]), "baseline=" + s(dng?["BaselineExposure"]),
             "neutral=" + s(dng?["AsShotNeutral"]), "analogBalance=" + s(dng?["AnalogBalance"]),
             "orientation=" + s(photo.metadata[kCGImagePropertyOrientation as String]),
-            "bytes=\(data.count)", String(format: "latency=%.2fs", Date().timeIntervalSince(p.pressed)),
+            "bytes=\(data.count)", String(format: "latency=%.2fs", (delivered - p.pressed)),
             String(format: "mem=%.0fMB", Look.footprintMB()), "flash=\(photo.resolvedSettings.isFlashEnabled)",
         ].joined(separator: " ")
         Self.log.info("\(line, privacy: .public)")
@@ -540,33 +634,42 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             Self.log.error("MISMATCH \(mismatch, privacy: .public)")
             fail("\(mismatch). The photo was saved as delivered.")
         }
-        let delta = p.preview.map { photo.timestamp.seconds - $0.pts } ?? .infinity
-        // Preserve the displayed frame across ordinary still startup lag. Slower stills require closer spatial agreement.
-        let match = abs(delta) <= 0.5
-            && p.preview.map { abs(p.pressed.timeIntervalSince($0.received)) <= 0.25 } == true
-        let shot = Shot(data: data, ext: photo.isRawPhoto ? "dng" : "heic", crop: p.crop, filter: p.filter,
-                        exposure: p.exposure, preview: p.preview,
-                        metadata: line + " delta=\(delta)", canMatch: match, previewDelay: abs(delta))
-        #if DEBUG
-        if Self.selfTestEnabled { return selfTestShot(shot) }
-        #endif
-        onCapture?(shot)
+        guard let onCapture else { return }
+        let shot = Shot(ext: photo.isRawPhoto ? "dng" : "heic", crop: p.crop, filter: p.filter,
+                        exposure: p.exposure, grainSeed: p.grainSeed, captureID: id, delivered: delivered, preview: preview)
+        lock.withLock { _ = writing.insert(id) }
+        Task {
+            await onCapture(shot, data)
+            lock.withLock { _ = writing.remove(id) }
+            updateBusy()
+        }
     }
 
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
         if let error { fail("The photo couldn't be captured: \(error.localizedDescription). Try again.") }
-        let busy = lock.withLock { pending[resolvedSettings.uniqueID] = nil; return captureBusy() }
-        DispatchQueue.main.async { self.busy = busy }
+        lock.withLock {
+            pending[resolvedSettings.uniqueID] = nil
+            sensorTimes[resolvedSettings.uniqueID] = nil
+            shutterPreviews[resolvedSettings.uniqueID] = nil
+        }
+        updateBusy()
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if !paused { previewDrops += 1 }
     }
 
     // MARK: - Live filtered viewfinder
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard !paused, let onFrame, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
-        let received = Date()
-        #if DEBUG
-        let t0 = Date()
-        #endif
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - previewReport >= 5 {
+            Self.log.debug("preview drops \(self.previewDrops) in \(now - self.previewReport) s, footprint \(Look.footprintMB()) MB")
+            previewReport = now
+            previewDrops = 0
+        }
+        guard lock.withLock({ !previewPending }) else { previewDrops += 1; return }
         var img = CIImage(cvPixelBuffer: pb)
         // the UI is portrait, so a landscape frame means the connection didn't rotate it: turn it upright here
         if img.extent.width > img.extent.height {
@@ -574,8 +677,8 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
         }
         // 2× stop: crop the full-resolution frame first, so the crop keeps real detail (scaling a small frame up didn't)
-        let (k, bias, ev, filter, generation, device) = lock.withLock {
-            (_crop, Double(_bias), _exposure, _filter, self.generation, previewDevice)
+        let (k, bias, ev, filter, generation, seed) = lock.withLock {
+            (_crop, Double(_bias), _exposure, _filter, self.generation, grainSeed)
         }
         if trustGeneration != generation {
             trustGeneration = generation
@@ -590,35 +693,51 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         // ISP-processed video is the reference for this frame's RAW development.
         let s = min(1, Self.previewSide / max(img.extent.width, img.extent.height))
         var props: [String: Any] = [Look.clipKey: pow(2, -bias)] // 8-bit video white, after the bias gain below
-        props[Look.evKey] = Self.sceneEV(sb) // same EV100 the saved photo's EXIF gives: light-dependent looks match the final
+        let sceneEV = Self.sceneEV(sb)
+        props[Look.evKey] = sceneEV // same EV100 the saved photo's EXIF gives: light-dependent looks match the final
         img = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
             // frames are underexposed by the capture bias, like the DNG before decode: restore the same way
             .applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -bias])
             .settingProperties(props)
         frameCount += 1
         let current = lock.withLock { _analysis }
-        let analysis = current ?? Look.analyze(img)
-        if current == nil {
-            lock.withLock { if self.generation == generation { _analysis = analysis } }
-        }
-        if !analyzing, frameCount % 4 == 0 { analyzeAsync(img, generation: generation) }
+        let analysis = current ?? Look.Analysis(wb: (1, 1, 1), clip: pow(2, -bias), sceneEV: sceneEV)
+        if !analyzing, current == nil || frameCount % 12 == 0 { analyzeAsync(img, generation: generation) }
         var r = Recipe(filter: filter)
         r.exposure = ev
-        if filter == Filter.leicaM6.id { r.grainSeed = lock.withLock { grainSeed } }
+        if Filter.named(filter).grade.grain > 0 { r.grainSeed = seed }
+        // Lightweight approximation of the photograph: the same look, grade and output transform on Apple's video frame
+        // (which already carries the ISP's own local tone mapping, so the still's local development isn't repeated here).
         let out = Look.apply(r, to: img, analysis: analysis)
-        if let cg = Look.context.createCGImage(out, from: out.extent, format: .RGBA8, colorSpace: Look.outputSpace) {
-            let s = 192 / max(img.extent.width, img.extent.height)
-            let small = img.transformed(by: CGAffineTransform(scaleX: s, y: s)).settingProperties(props)
-            let sample = PreviewSample(input: Look.materialize(small), analysis: analysis, pts: sb.presentationTimeStamp.seconds,
-                              received: received, generation: generation, filter: filter, exposure: ev,
-                              metadata: Self.parityDiagnostics ? Self.videoMetadata(pb, sb: sb, device: device, bias: bias) : "",
-                              rendered: cg, grainSeed: r.grainSeed)
-            guard lock.withLock({ self.generation == generation }) else { return }
-            onFrame(sample)
+        if let cg = Look.previewContext.createCGImage(out, from: out.extent, format: .RGBA8, colorSpace: Look.outputSpace) {
+            guard lock.withLock({
+                guard self.generation == generation else { return false }
+                if let tap = zoomStarted {
+                    Self.log.notice("zoom tap to first filtered frame \(Int((ProcessInfo.processInfo.systemUptime - tap) * 1000)) ms")
+                    zoomStarted = nil
+                }
+                latestPreview = (cg, filter, ev, now)
+                previewPending = true
+                return true
+            }) else { return }
+            #if DEBUG
+            if saveReferenceFrame, frameCount >= 24 {
+                saveReferenceFrame = false
+                let reference = CIImage(cgImage: cg)
+                let destination = URL.cachesDirectory.appending(path: "bettercam-color-reference.jpg")
+                analysisQueue.async {
+                    do {
+                        guard let data = Look.jpeg(reference, quality: 0.98) else { return }
+                        try data.write(to: destination, options: .atomic)
+                        Self.log.notice("Saved one preview reference for \(filter, privacy: .public), render revision \(Look.version)")
+                    } catch {
+                        Self.log.error("Failed to save preview reference: \(error.localizedDescription)")
+                    }
+                }
+            }
+            #endif
+            onFrame(PreviewSample(rendered: cg, generation: generation))
         }
-        #if DEBUG
-        if Self.selfTestEnabled { selfTestFrame(ms: Date().timeIntervalSince(t0) * 1000) }
-        #endif
     }
 
     /// The viewfinder's analysis, off the video queue (~7×/s): white balance, highlight statistics and, unless the phone is
@@ -652,174 +771,20 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         }
     }
 
-    // MARK: - Device self-test (Debug, launch argument -selftest)
-
-    #if DEBUG
-    /// Exercises the real capture pipeline sequentially with small renders and no gallery writes.
-    private static let selfTestEnabled = CommandLine.arguments.contains("-selftest")
-    private var selfTest: [(Mode, String)] = [
-        (.bayer, "1×"), (.bayer, "1×"), (.proRAW12, "1×"), (.proRAW48, "1×"), (.proRAW12, "2×")
-    ]
-    private var frameTimes: [Double] = []
-
-    static func say(_ s: String) {
-        FileHandle.standardError.write(Data(("SELFTEST " + s + "\n").utf8))
-        log.info("SELFTEST \(s, privacy: .public)")
-    }
-
-    private func selfTestFrame(ms: Double) {
-        frameTimes.append(ms)
-        if frameTimes.count == 90 {
-            let t = frameTimes.sorted()
-            Self.say(String(format: "viewfinder frame cost median %.1fms p95 %.1fms (90 frames) portrait=%.2f mem=%.0fMB",
-                            t[45], t[85], trust, Look.footprintMB()))
-            frameTimes = []
-        }
-        if frameCount == 120 { queue.async { self.selfTestNext() } }
-    }
-
-    private func selfTestNext() {
-        guard !selfTest.isEmpty else { return Self.say("DONE") }
-        let (m, label) = selfTest.removeFirst()
-        mode = m // reconfigures on this queue
-        DispatchQueue.main.async {
-            guard let stop = self.stops.first(where: { $0.label == label }) else {
-                self.queue.async { self.selfTestNext() }
-                return
-            }
-            if self.current != stop { self.select(stop) }
-            self.queue.asyncAfter(deadline: .now() + 2.5) {
-                Self.say("shoot \(m.rawValue) \(label) format=\(self.proRAWActive ? "ProRAW" : "Bayer") bias=\(self.lock.withLock { self._bias })")
-                self.capture()
-            }
-        }
-    }
-
-    private func selfTestShot(_ shot: Shot) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let url = FileManager.default.temporaryDirectory.appending(path: "selftest.\(shot.ext)")
-            defer {
-                try? FileManager.default.removeItem(at: url)
-                try? FileManager.default.removeItem(at: Look.shutterURL(for: url))
-                self.queue.asyncAfter(deadline: .now() + 1) { self.selfTestNext() }
-            }
-            guard (try? shot.data.write(to: url)) != nil else { return Self.say("FAIL write") }
-            _ = autoreleasepool { shot.recipe(for: url, diagnosticID: UUID().uuidString) }
-        }
-    }
-    #endif
 }
 
 extension Camera.Shot {
-    func recipe(for url: URL, diagnosticID: String) -> Recipe {
+    /// The look and adjustments at the press. Exposure is finalized from the saved original.
+    var provisionalRecipe: Recipe {
         var r = Recipe(filter: filter, crop: crop)
         r.exposure = min(max(exposure, Recipe.exposureRange.lowerBound), Recipe.exposureRange.upperBound)
-        if filter == Filter.leicaM6.id { r.grainSeed = preview?.grainSeed ?? UInt32.random(in: .min ... .max) }
-        if let preview, (try? Look.saveShutterFrame(preview.rendered, for: url)) != nil {
-            r.shutterLook = Recipe.ShutterLook(filter: r.filter, exposure: r.exposure)
+        r.grainSeed = grainSeed
+        if ext == "dng" {
+            r.baseExposure = -Look.rawCompensation
+            r.pendingCaptureExposure = true
         }
-        if canMatch, let preview, let input = preview.input,
-           let raw = Look.decode(url, crop: crop, maxSide: 600, normalizeForPreview: true, unsharpened: r.filter == Filter.leicaM6.id),
-           var match = Look.PreviewMatch(raw: raw, video: input, analysis: preview.analysis,
-                                         minimumCorrelation: previewDelay > 0.25 ? 0.85 : 0.65) {
-            let base = match.apply(to: raw)
-            let still = Look.apply(r, to: base, analysis: match.analysis(for: base))
-            match.matchDisplay(still: still, preview: CIImage(cgImage: preview.rendered))
-            r.previewMatch = match
-        }
-        if r.previewMatch == nil { r.baseExposure = Look.startingExposure(url, captured: true) }
-        #if DEBUG
-        if Camera.parityDiagnostics { diagnose(url, recipe: r, id: diagnosticID) }
-        #endif
         return r
     }
-
-    #if DEBUG
-    private func diagnose(_ url: URL, recipe: Recipe, id: String) {
-        let dir = URL.documentsDirectory.appending(path: "PreviewParity")
-        let fm = FileManager.default
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        let report = dir.appending(path: "\(id).txt")
-        let prior = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension == "txt" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
-        let saveFiles = prior.count < 12
-        var lines = [metadata, "look=\(filter) exposureSlider=\(exposure) crop=\(crop) shutterFrame=\(recipe.shutterLook != nil) matched=\(recipe.previewMatch != nil) displayMatched=\(recipe.previewMatch?.displayEV != nil)",
-                     preview?.metadata ?? "no fresh displayed frame", "output=SDR Display P3 8-bit JPEG"]
-        if let raw = CIRAWFilter(imageURL: url) {
-            lines += ["CIRAW baseline=\(raw.baselineExposure) exposure=\(raw.exposure) neutral=\(raw.neutralTemperature)K tint=\(raw.neutralTint)"]
-        }
-        var old = recipe
-        old.previewMatch = nil
-        old.baseExposure = Look.startingExposure(url, captured: true)
-        lines += ["legacy recipe EV=\(old.baseExposure)"]
-        if let match = recipe.previewMatch {
-            lines += ["development gain at knots=\(match.curves.map { curve in stride(from: 2, to: curve.count, by: 2).map { log2(curve[$0+1] / curve[$0]) } })",
-                      "preview clip=\(match.white) WB=\(match.wb) illuminant=\(match.illuminant) EV100=\(String(describing: match.sceneEV))",
-                      "portrait strength=\(match.selectiveStrength) subject gap=\(match.subjectGap) face gap=\(match.faceGap)"]
-        }
-        if let (base, analysis) = Look.photo(url, recipe: recipe, maxSide: 600),
-           let previous = Look.decode(url, crop: crop, maxSide: 600) {
-            let final = Look.renderPhoto(url, recipe: recipe, maxSide: 600) ?? Look.apply(recipe, to: base, analysis: analysis)
-            let before = Look.apply(old, to: previous)
-            let a = analysis ?? Look.analyze(base, subject: true)
-            let grade = recipe.grade.resolved(sceneEV: a.sceneEV)
-            let plan = Look.selectivePlan(grade, a, guide: base.applyingFilter("CILinearToSRGBToneCurve"))
-            lines += ["film exposure=\(grade.exposure) whiteStops=\(log2(a.clip / 0.18) + grade.exposure) contrast=\(grade.contrast) midContrast=\(grade.midContrast)",
-                      "face lift=\(plan?.lift ?? 0) background reduction=\(plan?.background ?? 0) faces=\(a.faces)"]
-            if saveFiles {
-                for (label, image) in [("before", before), ("final", final)] {
-                    try? Look.jpeg(image, quality: 0.9)?.write(to: dir.appending(path: "\(id)-\(label).jpg"), options: .atomic)
-                }
-            }
-            if let cg = preview?.rendered {
-                let scale = 600 / CGFloat(max(cg.width, cg.height))
-                let ref = CIImage(cgImage: cg).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-                if saveFiles {
-                    try? Look.jpeg(ref, quality: 0.9)?.write(to: dir.appending(path: "\(id)-preview.jpg"), options: .atomic)
-                }
-                lines += ["regional EV and ΔE OK (after / before): \(Self.regionalDelta(final, before: before, reference: ref, faces: a.faces))"]
-                if recipe.previewMatch?.displayEV != nil {
-                    let preDisplay = Look.apply(recipe.grade, to: base, analysis: analysis)
-                    lines += ["regional EV and ΔE OK (after / pre-display match): \(Self.regionalDelta(final, before: preDisplay, reference: ref, faces: a.faces))"]
-                }
-            }
-        }
-        let log = lines.joined(separator: "\n")
-        if saveFiles { try? log.write(to: report, atomically: true, encoding: .utf8) }
-        Camera.say(log)
-    }
-
-    private static func regionalDelta(_ final: CIImage, before: CIImage, reference: CIImage, faces: [CGRect]) -> String {
-        func tiles(_ image: CIImage) -> [(y: Double, lab: (Double, Double, Double))] {
-            let p = Look.PreviewMatch.tiles(image)
-            return stride(from: 0, to: p.count, by: 4).map { i in
-                let rg = 0.2126 * p[i] + 0.7152 * p[i + 1]
-                return (rg + 0.0722 * p[i + 2], OkLab.from((p[i], p[i + 1], p[i + 2])))
-            }
-        }
-        let ref = tiles(reference), new = tiles(final), old = tiles(before)
-        let sorted = ref.indices.sorted { ref[$0].y < ref[$1].y }
-        let n = sorted.count
-        let face = ref.indices.filter { i in
-            let point = CGPoint(x: (Double(i % 24) + 0.5) / 24, y: 1 - (Double(i / 24) + 0.5) / 24)
-            return faces.contains { $0.contains(point) }
-        }
-        return [("shadows", Array(sorted.prefix(n / 4))), ("midtones", Array(sorted[n*3/8..<n*5/8])),
-                ("highlights", Array(sorted.suffix(n / 4))), ("face", face)].map { label, region in
-            guard !region.isEmpty else { return "\(label)=n/a" }
-            func delta(_ values: [(y: Double, lab: (Double, Double, Double))]) -> (Double, Double) {
-                let ev = region.map { log2(max(0.001, values[$0].y) / max(0.001, ref[$0].y)) }.sorted()
-                let de = region.map { i -> Double in
-                    let (l, a, b) = values[i].lab, (rl, ra, rb) = ref[i].lab
-                    return 100 * sqrt(pow(l - rl, 2) + pow(a - ra, 2) + pow(b - rb, 2))
-                }.sorted()
-                return (ev[region.count / 2], de[region.count / 2])
-            }
-            let (afterEV, afterColor) = delta(new), (beforeEV, beforeColor) = delta(old)
-            return "\(label)=" + String(format: "%+.2f/%+.2f EV, %.1f/%.1f ΔE OK", afterEV, beforeEV, afterColor, beforeColor)
-        }.joined(separator: " ")
-    }
-    #endif
 }
 
 struct PreviewView: UIViewRepresentable {
@@ -832,7 +797,7 @@ struct PreviewView: UIViewRepresentable {
         v.preview.videoGravity = .resizeAspectFill
         camera.onFrame = { [weak v, weak camera] sample in
             DispatchQueue.main.async {
-                guard let v, camera?.didDisplay(sample) == true else { return }
+                guard camera?.didDisplay(sample) == true, let v else { return }
                 v.filtered.image = UIImage(cgImage: sample.rendered)
             }
         }

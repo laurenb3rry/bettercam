@@ -43,6 +43,13 @@ struct Grade: Equatable {
     var skinRegion = false    // skinChromaLocal over the person's measured skin color (face, neck, arms, hands), not the face ellipse only
     var night: Night? = nil   // extra moves faded in by scene darkness (EXIF EV), so a lit room isn't graded like a night street
     var grain = 0.0
+    var monochrome = false
+    var midtoneExposure = 0.0
+    // Revision 2 (research/23): explicit print placement for scene-referred input. 0 = derive both from `contrast` (≤ rev 1).
+    var greyLevel = 0.0       // display-linear level of scene 18% grey
+    var toneSlope = 0.0       // log-log midtone slope; the Contrast slider adds 2.2 × its offset
+    var monoMix = [0.40, 0.55, 0.05] // monochrome: linear-light spectral weights (the film + filter's sensitivity)
+    var localContrast = 0.0   // large-radius (≈1% of the frame) print contrast: dodge/burn-scale dimension, not texture
 
     /// Deltas at full darkness (EV ≤ `darkEV`), none at EV ≥ `lightEV`, smooth in between (quantized to quarters: LUT cache).
     struct Night: Equatable {
@@ -68,6 +75,7 @@ struct Grade: Equatable {
         static let centers: [Double] = [30, 60, 105, 145, 200, 260, 325] // OkLab hue: red, skin/orange, yellow, green, cyan, blue, magenta
         var on = false
         var wideGamut = false
+        var midtoneChroma: [Double]?
         var hueShift = [Double](repeating: 0, count: 7)   // degrees
         var chroma = [Double](repeating: 1, count: 7)     // ×, midtones
         var shadowChroma = [Double](repeating: 1, count: 7)    // extra × in shadows (L ≲ 0.45)
@@ -80,13 +88,16 @@ struct Grade: Equatable {
         var gamutKnee = 0.9              // chroma above this share of the gamut edge is compressed, not clipped
         // Phase 4 (research/14). Neutral defaults: EDITORIAL B renders bit-identically.
         var skinProtect = 0.0            // 0…1: share of hueShift/luma/density withheld from skin-gated colors (neighbors' moves don't drag skin)
+        var blueDensity = 0.0           // lightness reduction on pastel upper-mid blues
+        var foliageHue = 0.0            // degrees toward green for chromatic yellow-green midtones
         var skinHue = 0.0                // degrees added on the skin gate only (+ = toward golden)
 
         var key: String {
             guard on else { return "p0" }
             let parts: [[Double]] = [hueShift, chroma, shadowChroma, highlightChroma, luma, shadowSplit, highlightSplit, [density, skinChroma, gamutKnee]]
             let extra = skinProtect == 0 && skinHue == 0 ? "" : String(format: ",sp%.4f,%.4f", skinProtect, skinHue)
-            return parts.joined().map { String(format: "%.4f", $0) }.joined(separator: ",") + extra + (wideGamut ? ",p3" : "")
+            let mid = midtoneChroma.map { $0.map { String(format: "%.4f", $0) }.joined(separator: ",") } ?? ""
+            return parts.joined().map { String(format: "%.4f", $0) }.joined(separator: ",") + extra + (wideGamut ? ",p3" : "") + mid + (foliageHue == 0 && blueDensity == 0 ? "" : String(format: ",fd%.4f,%.4f", foliageHue, blueDensity))
         }
 
         static func mix(_ a: Print, _ b: Print, _ t: Double) -> Print {
@@ -94,6 +105,8 @@ struct Grade: Equatable {
             var p = a
             p.on = a.on || b.on
             p.wideGamut = a.wideGamut || b.wideGamut
+            p.blueDensity = a.blueDensity + (b.blueDensity - a.blueDensity) * t
+            p.foliageHue = a.foliageHue + (b.foliageHue - a.foliageHue) * t
             p.hueShift = m(a.hueShift, b.hueShift); p.chroma = m(a.chroma, b.chroma); p.luma = m(a.luma, b.luma)
             p.shadowChroma = m(a.shadowChroma, b.shadowChroma); p.highlightChroma = m(a.highlightChroma, b.highlightChroma)
             p.shadowSplit = m(a.shadowSplit, b.shadowSplit); p.highlightSplit = m(a.highlightSplit, b.highlightSplit)
@@ -140,10 +153,26 @@ struct Grade: Equatable {
             let skinW = skinHueW * Grade.smooth(0.01, 0.03, C0) * (1 - Grade.smooth(0.13, 0.2, C0))
             let keep = 1 - skinProtect * skinW // 1 unless skinProtect: then skin ignores the sector moves around it
             // hue-vs-hue, hue-vs-chroma by luminance band
-            let h2 = (h + Print.at(hueShift, h) * cw * keep + skinHue * skinW) * .pi / 180
+            let foliage = foliageHue == 0 ? 0 : foliageHue
+                * Grade.smooth(102, 117, h) * (1 - Grade.smooth(135, 165, h))
+                * Grade.smooth(0.024, 0.079, C0)
+                * Grade.smooth(0.16, 0.37, L) * (1 - Grade.smooth(0.68, 0.91, L))
+            let h2 = (h + Print.at(hueShift, h) * cw * keep + foliage * keep + skinHue * skinW) * .pi / 180
             let kS: Double = 1 + (Print.at(shadowChroma, h) - 1) * sh
             let kH: Double = 1 + (Print.at(highlightChroma, h) - 1) * hi
             var C: Double = C0 * Print.at(chroma, h) * kS * kH
+            if let midtoneChroma {
+                let mid = Grade.smooth(0.25, 0.55, L) * (1 - Grade.smooth(0.72, 0.94, L))
+                C *= 1 + Print.at(midtoneChroma, h) * mid * cw * keep
+            }
+            // Add density to pastel blues, with less pressure on saturated blues near the gamut knee.
+            if blueDensity > 0 {
+                let blue = Grade.smooth(222, 245, h) * (1 - Grade.smooth(278, 306, h))
+                    * Grade.smooth(0.025, 0.058, C0) * (1 - Grade.smooth(0.095, 0.16, C0))
+                    * Grade.smooth(0.55, 0.76, L) * (1 - Grade.smooth(0.89, 0.985, L))
+                L -= blueDensity * blue
+                C *= 1 + 3 * blueDensity * blue
+            }
             // hue-vs-luminance and subtractive density (colorful = deeper, like dye)
             let skinScale = 1 + (skinChroma - 1) * skinW
             if wideGamut {
@@ -209,7 +238,7 @@ struct Grade: Equatable {
     /// so dragging those sliders never rebuilds it.
     var lutKey: String {
         ([contrast, saturation, blackLift, whitePoint, warmSat, warmShift, greenSat, greenShift, blueSat, blueShift, density,
-          midContrast, toeWidth, hueHold, shadowChroma, highlightChroma, skinSat, greenCompress]
+          midContrast, toeWidth, hueHold, shadowChroma, highlightChroma, skinSat, greenCompress, greyLevel, toneSlope]
             + shadowTint + highlightTint)
             .map { String(format: "%.3f", $0) }.joined(separator: ",") + "|" + print.key
     }
@@ -308,17 +337,21 @@ struct Filter: Identifiable, Equatable {
     let name: String
     let grade: Grade
 
-    static func named(_ id: String) -> Filter { (all + retired + [naturalReference]).first { $0.id == id } ?? all[0] }
+    static func named(_ id: String, revision: Int = Filter.revision) -> Filter {
+        if revision == 0, let old = historical.first(where: { $0.id == id }) { return old }
+        if revision <= 1, let old = revision1.first(where: { $0.id == id }) { return old }
+        return (all + retired + [naturalReference]).first { $0.id == id } ?? editorial
+    }
 
-    /// First = default for new photos and the camera. Editorial set (research/newFilters_11_18.md) leads, in its launch order.
-    /// Debug builds also list the Natural Reference, so it can be picked on the phone without shipping it.
-    #if DEBUG
-    static let all: [Filter] = [editorial, leicaM6, riviera, sunStudy, afterHours, alpine, chroma, natural, naturalReference]
-    #else
-    static let all: [Filter] = [editorial, leicaM6, riviera, sunStudy, afterHours, alpine, chroma, natural]
-    #endif
-    /// Out of the app but kept: photos already saved with them still render with their look.
-    static let retired: [Filter] = [editorialPhase3, editorialV1, portra, eterna, cmbyn, dune, br2049, classicChrome, nostalgicNeg]
+    /// 2 (2026-11-23, research/23): scene-referred development for every RAW and rebuilt looks. 1: rev 27 grades on
+    /// Apple's ProRAW profile rendering, frozen in `revision1` so saved photos keep rendering as they were.
+    static let revision = 2
+    static let revision1: [Filter] = [editorialR1, leicaM6R1, chromaR1, afterHoursR1, sunprintR1, atmosphereR1, monochromeR1]
+    static let all: [Filter] = [editorial, leicaM6, chroma, afterHours, sunprint, atmosphere, monochrome]
+    private static let historical = [editorialHistorical, chromaHistorical, afterHoursHistorical]
+    static let retired: [Filter] = [riviera, sunStudy, alpine, natural, editorialPhase3, editorialV1,
+                                   portra, eterna, cmbyn, dune, br2049, classicChrome, nostalgicNeg, foundation]
+
 
     /// Builds a look from the research tables (§5.2 tone/texture, §5.3 hue sectors). Absolute values, not deltas.
     private static func look(_ id: String, _ name: String,
@@ -353,21 +386,23 @@ struct Filter: Identifiable, Equatable {
         return Filter(id: "naturalReference", name: "Reference", grade: g)
     }()
 
-    static let leicaM6 = Filter(id: "leicaM6", name: "LEICA M6", grade: {
+    static let leicaM6R1 = Filter(id: "leicaM6", name: "LEICA M6", grade: {
         var g = naturalReference.grade
-        g.exposure -= 0.04
-        g.midContrast = 0.31; g.toeWidth = 1.35
-        g.hueHold = 0.63
-        g.bloom = 0.035; g.grain = 0.035
+        g.exposure -= 0.06
+        g.midContrast = 0.43; g.toeWidth = 1.10
+        g.hueHold = 0.78
+        g.bloom = 0.026; g.grain = 0.035
         var p = Grade.Print()
         p.on = true; p.wideGamut = true
-        // Red canopy, varnish, turf, open water and twilight each occupy different parts of the print gamut.
-        p.chroma          = [1.19, 1.13, 1.03, 0.97, 1.18, 1.13, 1.08]
-        p.shadowChroma    = [1.02, 0.99, 0.96, 0.96, 1.04, 1.03, 1.00]
-        p.highlightChroma = [0.96, 0.94, 0.91, 0.90, 0.90, 0.92, 0.93]
-        p.hueShift        = [1.5, 0, -2, 3, -4, 2, 0]
-        p.luma            = [-0.043, -0.018, 0.012, -0.026, -0.045, -0.065, -0.010]
-        p.density = 0.020; p.skinProtect = 0.95; p.skinChroma = 0.87; p.gamutKnee = 0.87
+        p.chroma          = [1.26, 1.10, 1.02, 1.18, 1.26, 1.29, 1.25]
+        p.shadowChroma    = [1.10, 1.02, 0.98, 1.22, 1.12, 1.15, 1.13]
+        p.highlightChroma = [0.98, 0.96, 0.95, 0.90, 1.04, 1.06, 1.06]
+        p.hueShift        = [-2, 0, 0, 3, -5, -3, -3]
+        p.luma            = [-0.050, -0.010, 0.010, -0.035, 0.016, -0.105, 0.007]
+        p.midtoneChroma   = [0.04, 0, 0, 0.10, 0.09, 0.11, 0.11]
+        p.shadowSplit = [-0.004, -0.009]
+        p.foliageHue = 19; p.blueDensity = 0.070
+        p.density = 0.033; p.skinProtect = 0.97; p.skinChroma = 1.01; p.gamutKnee = 0.86
         g.print = p
         return g
     }())
@@ -402,7 +437,7 @@ struct Filter: Identifiable, Equatable {
     /// its selective (person/face) pass, face lift cap +0.30 EV and face skin chroma ×1.2.
     /// Photographic print density, a visible but believable film crossover (teal shadow tones, amber highlights), deep blues and
     /// reds, olive greens, textured highlights with a touch of halation. Sector order: red, skin, yellow, green, cyan, blue, magenta.
-    static let editorial: Filter = {
+    private static let editorialHistorical: Filter = {
         var g = naturalReference.grade
         g.exposure -= 0.05
         g.midContrast = 0.48; g.toeWidth = 1.1        // print-like snap; toe hands back fast so blacks keep texture
@@ -424,6 +459,257 @@ struct Filter: Identifiable, Equatable {
         g.faceLift = 0.30; g.backgroundTone = 0.25; g.skinChromaLocal = 1.20 // user's pick from the face ladder
         return Filter(id: "editorial", name: "Editorial", grade: g)
     }()
+
+    // Sector order: red, orange, yellow, green, cyan, blue, magenta.
+    static let editorialR1 = Filter(id: "editorial", name: "EDITORIAL", grade: {
+        var g = editorialHistorical.grade
+        g.exposure += 0.06; g.midtoneExposure = 0.11
+        g.midContrast = 0.37; g.toeWidth = 0.95; g.hueHold = 0.74
+        g.bloom = 0; g.microcontrast = 0.012
+        g.warmAdapt = 0.12; g.tintAdapt = 0.36
+        g.faceLift = 0.22; g.backgroundTone = 0.14
+        g.skinRegion = true; g.skinChromaLocal = 1.08
+        var p = g.print
+        p.wideGamut = true; p.skinProtect = 0.92; p.skinChroma = 1.04
+        p.chroma = [1.09, 1.03, 0.89, 0.73, 0.92, 1.07, 0.96]
+        p.shadowChroma = [0.95, 0.96, 0.85, 0.76, 0.90, 1.09, 0.85]
+        p.highlightChroma = [0.92, 0.95, 0.87, 0.82, 0.89, 0.90, 0.93]
+        p.hueShift = [0, 0, -4, 10, -2, 3, -1]
+        p.luma = [-0.04, 0.02, 0.01, -0.04, -0.03, -0.12, -0.02]
+        p.shadowSplit = [0, -0.003]; p.highlightSplit = [0, 0]
+        p.density = 0.035
+        g.print = p
+        return g
+    }())
+
+    static let chromaR1 = Filter(id: "chroma", name: "CHROMA", grade: {
+        var (g, p) = p4Base()
+        g.exposure -= 0.06; g.midtoneExposure = -0.16; g.midContrast = 0.51; g.toeWidth = 1.35
+        g.hueHold = 0.84; g.bloom = 0.070; g.grain = 0.080
+        g.faceLift = 0.16
+        p.wideGamut = true; p.skinProtect = 0.91
+        p.chroma = [1.38, 1.06, 1.02, 0.96, 1.27, 1.42, 1.25]
+        p.shadowChroma = [1.12, 0.95, 0.81, 0.91, 1.20, 1.23, 1.12]
+        p.highlightChroma = [1.09, 0.92, 0.96, 0.86, 0.94, 0.91, 0.97]
+        p.midtoneChroma = [0.12, 0, 0.03, 0, 0.13, 0.15, 0.08]
+        p.hueShift = [-6, 0, -6, -12, -13, 7, -9]
+        p.luma = [-0.10, 0, 0.045, -0.08, 0.04, -0.14, -0.065]
+        p.shadowSplit = [-0.012, -0.015]; p.highlightSplit = [0.004, 0.007]
+        p.density = 0.084; p.gamutKnee = 0.79
+        g.print = p
+        return g
+    }())
+
+    static let afterHoursR1 = Filter(id: "afterHours", name: "AFTER HOURS", grade: {
+        var g = afterHoursHistorical.grade
+        g.exposure += 0.08; g.midtoneExposure = -0.06; g.midContrast = 0.34; g.toeWidth = 0.95
+        g.hueHold = 0.94; g.bloom = 0.035
+        g.faceLift = 0.21; g.backgroundTone = 0.09; g.skinChromaLocal = 1.04
+        var p = g.print
+        p.wideGamut = true; p.skinProtect = 0.92; p.skinHue = 0
+        p.chroma = [1.19, 1.01, 1.05, 0.81, 0.92, 1.06, 1.07]
+        p.shadowChroma = [0.83, 0.76, 0.71, 0.61, 0.70, 0.83, 0.77]
+        p.highlightChroma = [1.11, 1.00, 1.10, 0.91, 0.94, 1.00, 1.05]
+        p.hueShift = [-4, 0, -8, 0, -3, 1, 2]
+        p.luma = [0.035, 0.012, 0.045, -0.07, -0.025, -0.065, -0.015]
+        p.shadowSplit = [0, -0.005]; p.highlightSplit = [0, 0]
+        p.density = 0.026
+        g.print = p
+        var night = Grade.Night()
+        night.lightEV = 10.0
+        night.exposure = -0.08; night.midContrast = 0.08; night.bloom = 0.025
+        night.chroma = [1.09, 1, 1.07, 0.98, 1.03, 1.09, 1.09]
+        g.night = night
+        return g
+    }())
+
+    static let sunprintR1 = Filter(id: "sunprint", name: "SUNPRINT", grade: {
+        var (g, p) = p4Base()
+        g.exposure += 0.08; g.midtoneExposure = 0.18; g.midContrast = 0.26; g.toeWidth = 1.65
+        g.hueHold = 0.64; g.bloom = 0.019; g.grain = 0.065
+        g.faceLift = 0.12; g.microcontrast = 0.009
+        p.wideGamut = true; p.skinProtect = 0.86; p.skinHue = 4
+        p.chroma = [1.12, 1.15, 1.23, 0.88, 0.99, 1.01, 0.86]
+        p.shadowChroma = [1.03, 1.10, 1.10, 0.88, 1.01, 1.06, 0.93]
+        p.highlightChroma = [0.98, 0.96, 1.09, 0.83, 0.91, 0.94, 0.87]
+        p.hueShift = [6, 5, -7, 18, 0, -2, 0]
+        p.luma = [-0.04, 0.015, 0.055, -0.045, 0.01, -0.07, -0.018]
+        p.shadowSplit = [0.004, 0.011]; p.highlightSplit = [0.001, 0.004]
+        p.density = 0.034; p.skinChroma = 1.09
+        g.print = p
+        return g
+    }())
+
+    static let atmosphereR1 = Filter(id: "atmosphere", name: "ATMOSPHERE", grade: {
+        var (g, p) = p4Base()
+        g.exposure += 0.17; g.midtoneExposure = 0.30; g.midContrast = 0.13; g.toeWidth = 1.8
+        g.hueHold = 0.79; g.bloom = 0; g.microcontrast = 0.013
+        p.wideGamut = true; p.skinProtect = 0.96
+        p.chroma = [0.98, 0.99, 0.84, 0.80, 1.21, 1.13, 0.86]
+        p.shadowChroma = [0.94, 0.95, 0.85, 0.89, 1.10, 1.19, 0.91]
+        p.highlightChroma = [0.94, 0.97, 0.87, 0.82, 1.03, 0.89, 0.87]
+        p.hueShift = [0, 0, -2, -8, -7, 3, 0]
+        p.luma = [-0.008, 0, 0.025, -0.07, 0.080, -0.14, -0.026]
+        p.shadowSplit = [-0.006, -0.017]; p.highlightSplit = [0, 0]
+        p.blueDensity = 0.030; p.density = 0.027
+        g.print = p
+        return g
+    }())
+
+    static let monochromeR1 = Filter(id: "monochrome", name: "MONOCHROME", grade: {
+        var g = naturalReference.grade
+        g.monochrome = true
+        g.exposure += 0.07; g.midContrast = 0.53; g.toeWidth = 1.13
+        g.grain = 0.10; g.microcontrast = 0.022
+        g.faceLift = 0.13
+        return g
+    }())
+
+    // MARK: Revision 2 looks (research/23-photographic-engine-v3.md). Scene-referred input: these grades are the photo's only
+    // tone curve. Sector order: red, orange/skin, yellow, green, cyan, blue, magenta.
+
+    /// The shared revision 2 print foundation (diagnostic id `foundation`): placement, slope and per-channel response only.
+    static func sceneBase() -> (Grade, Grade.Print) {
+        var g = naturalReference.grade
+        g.contrast = 0.55; g.exposure = 0
+        g.greyLevel = 0.19; g.toneSlope = 1.30; g.midContrast = 0.22; g.toeWidth = 1.3
+        g.hueHold = 0.55; g.saturation = 1.0
+        g.skinRegion = true
+        var p = Grade.Print(); p.on = true; p.wideGamut = true; p.skinProtect = 0.9
+        return (g, p)
+    }
+    static let foundation: Filter = {
+        var (g, p) = sceneBase(); g.print = p
+        return Filter(id: "foundation", name: "Foundation", grade: g)
+    }()
+
+
+    /// LEICA M6: a well-exposed, professionally scanned colour negative with a rich print. Deep skies and water by
+    /// lightness (not neon chroma), greens alive and yellow-green rather than forest, warm healthy skin, luminous whites.
+    static let leicaM6 = Filter(id: "leicaM6", name: "LEICA M6", grade: {
+        var (g, p) = sceneBase()
+        g.greyLevel = 0.19; g.toneSlope = 1.32; g.midContrast = 0.32; g.toeWidth = 1.2
+        g.hueHold = 0.72; g.bloom = 0.02; g.grain = 0.035; g.localContrast = 0.10
+        p.chroma          = [1.16, 1.06, 1.04, 1.10, 1.16, 1.28, 1.08]
+        p.shadowChroma    = [1.04, 1.02, 0.96, 1.06, 1.08, 1.10, 1.00]
+        p.highlightChroma = [0.98, 0.98, 1.00, 0.94, 1.04, 1.06, 0.96]
+        p.hueShift        = [-1, 1, -2, -2, -3, -3, 4]
+        p.luma            = [-0.04, 0.0, 0.02, -0.02, 0.0, -0.12, -0.02]
+        p.shadowSplit = [-0.002, -0.004]; p.highlightSplit = [0.001, 0.003]
+        p.blueDensity = 0.08; p.density = 0.03; p.skinChroma = 1.02; p.gamutKnee = 0.86
+        g.print = p
+        return g
+    }())
+
+    /// EDITORIAL: fashion-campaign print. Open, dimensional skin; deep textured blacks; clean whites (highlight chroma
+    /// calmed); restrained yellow-green scenery; rich red and indigo accents. Measured, bounded subject/background moves.
+    static let editorial = Filter(id: "editorial", name: "EDITORIAL", grade: {
+        var (g, p) = sceneBase()
+        g.greyLevel = 0.20; g.toneSlope = 1.36; g.midContrast = 0.30; g.toeWidth = 1.0
+        g.hueHold = 0.6; g.microcontrast = 0.012; g.localContrast = 0.12
+        g.warmAdapt = 0.12; g.tintAdapt = 0.36
+        g.faceLift = 0.18; g.backgroundTone = 0.12; g.skinChromaLocal = 1.04
+        p.chroma          = [1.08, 1.02, 0.90, 0.80, 0.92, 1.06, 0.95]
+        p.shadowChroma    = [1.00, 0.98, 0.85, 0.80, 0.90, 1.06, 0.88]
+        p.highlightChroma = [0.92, 0.95, 0.85, 0.82, 0.88, 0.90, 0.90]
+        p.hueShift        = [0, 0, -3, 6, -2, 3, -2]
+        p.luma            = [-0.04, 0.01, 0.0, -0.04, -0.03, -0.07, -0.02]
+        p.shadowSplit = [0, -0.002]
+        p.density = 0.035; p.skinProtect = 0.92; p.skinChroma = 1.02
+        g.print = p
+        return g
+    }())
+
+    /// CHROMA: cinematic colour relationships. Warm/cool separation lives in a tonal crossover (teal shadow tones, warm
+    /// shoulder) rather than per-hue saturation; red holds toward vermilion and magenta folds toward red, so dark red
+    /// materials in skylight can't drift violet; blue and cyan stay distinct by hue and lightness. Dense mids, grain, halation.
+    static let chroma = Filter(id: "chroma", name: "CHROMA", grade: {
+        var (g, p) = sceneBase()
+        g.greyLevel = 0.165; g.toneSlope = 1.42; g.midContrast = 0.38; g.toeWidth = 1.2
+        g.hueHold = 0.72; g.bloom = 0.06; g.grain = 0.07; g.localContrast = 0.10
+        g.faceLift = 0.12
+        p.chroma          = [1.22, 1.10, 1.02, 0.90, 1.12, 1.08, 0.82]
+        p.shadowChroma    = [1.02, 1.00, 0.85, 0.88, 1.10, 1.00, 0.80]
+        p.highlightChroma = [1.04, 1.02, 0.98, 0.86, 0.96, 0.92, 0.90]
+        p.midtoneChroma   = [0.08, 0.06, 0, 0, 0.08, 0.04, 0]
+        p.hueShift        = [4, 2, -4, -6, -6, -6, 14]
+        p.luma            = [-0.06, 0.02, 0.03, -0.06, 0.03, -0.11, -0.04]
+        p.shadowSplit = [-0.007, -0.002]; p.highlightSplit = [0.002, 0.004]
+        p.blueDensity = 0.05; p.density = 0.06; p.gamutKnee = 0.82; p.skinProtect = 0.92
+        g.print = p
+        return g
+    }())
+
+    /// AFTER HOURS: night. A darker print with deep but textured blacks, practicals that keep their hue into the
+    /// shoulder, calm low-light chroma (noise), and darkness-gated extra density for real night scenes.
+    static let afterHours = Filter(id: "afterHours", name: "AFTER HOURS", grade: {
+        var (g, p) = sceneBase()
+        g.greyLevel = 0.16; g.toneSlope = 1.34; g.midContrast = 0.28; g.toeWidth = 0.95
+        g.hueHold = 0.9; g.bloom = 0.035; g.grain = 0.045
+        g.faceLift = 0.2; g.backgroundTone = 0.08; g.skinChromaLocal = 1.04
+        p.chroma          = [1.16, 1.06, 1.06, 0.84, 0.94, 1.08, 1.06]
+        p.shadowChroma    = [0.82, 0.78, 0.72, 0.62, 0.72, 0.84, 0.78]
+        p.highlightChroma = [1.10, 1.04, 1.10, 0.90, 0.96, 1.00, 1.04]
+        p.hueShift        = [-3, 0, -6, 0, -3, 0, 2]
+        p.luma            = [0.03, 0.01, 0.04, -0.06, -0.02, -0.05, -0.01]
+        p.shadowSplit = [0, -0.004]
+        p.density = 0.026; p.skinProtect = 0.92
+        g.print = p
+        var night = Grade.Night()
+        night.lightEV = 10.0
+        night.exposure = -0.15; night.midContrast = 0.08; night.bloom = 0.025
+        night.chroma = [1.08, 1, 1.06, 0.98, 1.03, 1.08, 1.08]
+        g.night = night
+        return g
+    }())
+
+    /// SUNPRINT: sunlit colour. Warmth lives in lit warm materials (skin, wood, sand, stone: orange/yellow chroma and
+    /// lightness) and a cream trace in the brightest highlights, not a global tint; clear blue sky; shadows stay neutral.
+    static let sunprint = Filter(id: "sunprint", name: "SUNPRINT", grade: {
+        var (g, p) = sceneBase()
+        g.greyLevel = 0.20; g.toneSlope = 1.30; g.midContrast = 0.28; g.toeWidth = 1.4
+        g.hueHold = 0.62; g.bloom = 0.02; g.grain = 0.05; g.microcontrast = 0.009; g.localContrast = 0.08
+        g.faceLift = 0.12
+        p.chroma          = [1.10, 1.14, 1.16, 0.90, 1.00, 1.08, 0.88]
+        p.shadowChroma    = [1.04, 1.10, 1.04, 0.90, 0.98, 1.04, 0.92]
+        p.highlightChroma = [1.00, 1.02, 1.08, 0.86, 0.94, 0.98, 0.88]
+        p.hueShift        = [4, 3, -4, 4, 0, -2, 0]
+        p.luma            = [-0.03, 0.02, 0.04, -0.03, 0.0, -0.06, -0.02]
+        p.highlightSplit = [0.001, 0.004]
+        p.density = 0.032; p.skinHue = 3; p.skinChroma = 1.05; p.skinProtect = 0.86
+        g.print = p
+        return g
+    }())
+
+    /// ATMOSPHERE: landscape, water and weather. The most open print with a long toe; cyan water lifted and luminous,
+    /// blue sky deeper, greens cooler and calmer so distance separates by hue and value; cool air only in shadow tones.
+    static let atmosphere = Filter(id: "atmosphere", name: "ATMOSPHERE", grade: {
+        var (g, p) = sceneBase()
+        g.greyLevel = 0.21; g.toneSlope = 1.24; g.midContrast = 0.16; g.toeWidth = 1.8
+        g.hueHold = 0.75; g.microcontrast = 0.014; g.localContrast = 0.10
+        p.chroma          = [0.98, 0.98, 0.88, 0.86, 1.18, 1.10, 0.88]
+        p.shadowChroma    = [0.94, 0.95, 0.85, 0.90, 1.10, 1.12, 0.90]
+        p.highlightChroma = [0.94, 0.96, 0.88, 0.84, 1.04, 0.92, 0.88]
+        p.hueShift        = [0, 0, -2, -6, -5, 2, 0]
+        p.luma            = [-0.01, 0, 0.02, -0.05, 0.06, -0.09, -0.02]
+        p.shadowSplit = [-0.003, -0.007]
+        p.blueDensity = 0.03; p.density = 0.027; p.skinProtect = 0.96
+        g.print = p
+        return g
+    }())
+
+    /// MONOCHROME: a printed panchromatic black-and-white. A light orange-filter response (red heavier, blue lighter) so
+    /// skin separates from dark clothing and blue sky prints deeper; firm print curve with a short toe for deep but textured
+    /// blacks; large-scale print contrast for dimension; a measured face lift and background hold; fine luminance grain.
+    static let monochrome = Filter(id: "monochrome", name: "MONOCHROME", grade: {
+        var (g, _) = sceneBase()
+        g.monochrome = true
+        g.monoMix = [0.52, 0.44, 0.04]
+        g.exposure = 0.22; g.greyLevel = 0.20; g.toneSlope = 1.42; g.midContrast = 0.38; g.toeWidth = 1.0
+        g.grain = 0.08; g.microcontrast = 0.018; g.localContrast = 0.16
+        g.faceLift = 0.3; g.backgroundTone = 0.3
+        return g
+    }())
 
     // MARK: Phase 4 looks (research/14-phase4-look-collection.md), promoted by the user 2026-11-19 (old versions removed).
     // Same engine as EDITORIAL B (OkLab print transform + selective pass), each with
@@ -511,7 +797,7 @@ struct Filter: Identifiable, Equatable {
     /// colored (as-shot WB, no warm adaptation, high hueHold), calm chroma noise in the shadows.
     /// Its theatrical part is *gated by darkness* (`night`, EXIF EV ≤ 4.5 full, ≥ 7.5 none): darker exposure, more red/amber/
     /// blue/magenta, bloom around real sources. A neutral fluorescent room (EV ≈ 8) gets only the dense day version.
-    static let afterHours: Filter = {
+    private static let afterHoursHistorical: Filter = {
         var (g, p) = p4Base()
         g.exposure -= 0.17
         g.midContrast = 0.52; g.toeWidth = 1.0
@@ -542,7 +828,7 @@ struct Filter: Identifiable, Equatable {
 
     // Earlier looks (research/rawCameraResearch.md §5.4). Subject intent in comments.
     /// Chromagraph-inspired: skin gently warmer, not orange; soft bright transitions; quieter greens/blues.
-    static let chroma = look("chroma", "Chroma", 0.48, 0.71, 0.003, 0.987, 0.96, 0.050, 0.10,
+    private static let chromaHistorical = look("chroma", "Chroma", 0.48, 0.71, 0.003, 0.987, 0.96, 0.050, 0.10,
                              temp: 0.012, warm: (1.02, -1), green: (0.93, -1), blue: (0.93, 0))
     /// Portra 400: soft pink/peach skin, gentle shoulder, restrained foliage.
     static let portra = look("portra", "Portra", 0.60, 0.66, 0.005, 0.992, 0.97, 0.035, 0.025,

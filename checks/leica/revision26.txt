@@ -1,0 +1,21 @@
+    static let leicaM6 = Filter(id: "leicaM6", name: "LEICA M6", grade: {
+        var g = naturalReference.grade
+        g.exposure -= 0.04
+        g.midContrast = 0.31; g.toeWidth = 1.35
+        g.hueHold = 0.63
+        g.bloom = 0.035; g.grain = 0.035
+        var p = Grade.Print()
+        p.on = true; p.wideGamut = true
+        // Red canopy, varnish, turf, open water and twilight each occupy different parts of the print gamut.
+        p.chroma          = [1.19, 1.13, 1.03, 0.97, 1.18, 1.13, 1.08]
+        p.shadowChroma    = [1.02, 0.99, 0.96, 0.96, 1.04, 1.03, 1.00]
+        p.highlightChroma = [0.96, 0.94, 0.91, 0.90, 0.90, 0.92, 0.93]
+        p.hueShift        = [1.5, 0, -2, 4, -4, 2, 0]
+        p.luma            = [-0.043, -0.018, 0.012, -0.018, -0.045, -0.065, -0.010]
+        // revision 2 (research/18): lightness-gated midtone chroma for green, cyan and blue, so foliage, water and sky
+        // separate from gold and brown terrain. The default since engine 2 (was RAW Trial only).
+        p.midtoneChroma   = [0, 0, 0, 0.075, 0.052, 0.038, 0]
+        p.density = 0.020; p.skinProtect = 0.95; p.skinChroma = 0.87; p.gamutKnee = 0.87
+        g.print = p
+        return g
+    }())

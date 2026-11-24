@@ -57,7 +57,7 @@ struct CameraView: View {
                 }
 
             HStack(spacing: 12) {
-                if camera.current?.isFront != true {
+                if camera.selected?.isFront != true {
                     ForEach(camera.stops) { stop in
                         Button(stop.label) { camera.select(stop) }
                             .font(.footnote.weight(.medium))
@@ -72,9 +72,9 @@ struct CameraView: View {
 
             HStack {
                 Button { showGallery = true } label: {
-                    Thumb(url: library.shots.first.map { library.thumb($0.id) })
-                        .id(library.shots.first)
-                        .frame(width: 52, height: 52)
+                    Thumb(url: library.shots.first.map { library.thumb($0.id) }, version: library.shots.first?.version,
+                      animatedShotID: library.shots.first?.id)
+                    .frame(width: 52, height: 52)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 Spacer()
@@ -102,6 +102,11 @@ struct CameraView: View {
             GalleryView().environmentObject(library) // swipe down = back to camera; the session keeps running
         }
         .onChange(of: filterID, initial: true) { _, id in
+            guard Filter.all.contains(where: { $0.id == id }) else {
+                filterID = Filter.all[0].id
+                camera.filter = filterID
+                return
+            }
             camera.filter = id
             withAnimation(.easeOut(duration: 0.15)) { showName = true }
             Task {
@@ -110,7 +115,7 @@ struct CameraView: View {
             }
         }
         .task {
-            camera.onCapture = { shot in Task { @MainActor in await library.add(shot) } }
+            camera.onCapture = { shot, data in await library.add(shot, data: data) }
             camera.start(preferred: lastLens, mode: Camera.Mode(rawValue: rawMode) ?? .standard)
         }
         .onChange(of: ev) { _, v in camera.exposure = v }
@@ -150,17 +155,11 @@ extension CameraView {
     }
 
     /// What the next shot will actually be (checked against the file after every shot). Tap to pick the capture format;
-    /// the choice is remembered. Debug builds also list the fixed −1 EV Bayer mode for comparisons.
+    /// the choice is remembered and never changed by the app: an unsupported lens says so on the chip instead.
     private var formatChip: some View {
         Menu {
             Picker("Capture", selection: $rawMode) {
-                ForEach(Camera.Mode.allCases.filter { m in
-                    #if DEBUG
-                    true
-                    #else
-                    m != .bayerFixed
-                    #endif
-                }) { Text($0.rawValue).tag($0.rawValue) }
+                ForEach(Camera.Mode.allCases) { Text($0.rawValue).tag($0.rawValue) }
             }
         } label: {
             Text(camera.format).font(.caption2.weight(.bold)).foregroundStyle(.white)
@@ -207,24 +206,66 @@ struct ThirdsGrid: View {
 /// Grid/thumbnail tile. Decoded off the main thread and cached (by path + file date), so the gallery scrolls smoothly.
 struct Thumb: View {
     let url: URL?
-    @State private var image: UIImage?
-    private static let cache = NSCache<NSString, UIImage>()
+    let version: Date?
+    var animatedShotID: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var loaded: (url: URL, image: UIImage, shotID: String?)?
+    private static let cache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 48
+        cache.totalCostLimit = 32 * 1024 * 1024
+        return cache
+    }()
+
+    static func cacheImage(_ image: UIImage, for url: URL, version: Date?) {
+        let cost = image.cgImage.map { $0.bytesPerRow * $0.height } ?? 0
+        cache.setObject(image, forKey: key(for: url, version: version), cost: cost)
+    }
+
+    static func cachedImage(for url: URL, version: Date?) -> UIImage? {
+        cache.object(forKey: key(for: url, version: version))
+    }
+
+    static func loadImage(for url: URL, version: Date?) async -> UIImage? {
+        let key = key(for: url, version: version)
+        if let hit = cache.object(forKey: key) { return hit }
+        guard version != .distantPast, !Task.isCancelled else { return nil }
+        let image = await Task.detached(priority: .userInitiated) {
+            UIImage(contentsOfFile: url.path)?.preparingForDisplay()
+        }.value
+        if let image { cacheImage(image, for: url, version: version) }
+        return image
+    }
+
+    private static func key(for url: URL, version: Date?) -> NSString {
+        "\(url.path)@\(version?.timeIntervalSince1970 ?? 0)" as NSString
+    }
 
     var body: some View {
-        Rectangle().fill(.white.opacity(0.08))
+        let key = url.map { Self.key(for: $0, version: version) }
+        Rectangle().fill(.clear)
             .aspectRatio(1, contentMode: .fit)
             .overlay {
-                if let image { Image(uiImage: image).resizable().scaledToFill() }
+                if let shown = animatedShotID != nil ? loaded?.image
+                    : key.flatMap({ Self.cache.object(forKey: $0) }) ?? (loaded?.url == url ? loaded?.image : nil) {
+                    Image(uiImage: shown).resizable().scaledToFill()
+                        .id(loaded?.shotID)
+                        .transition(.asymmetric(insertion: .scale(scale: 0.05, anchor: .center), removal: .identity))
+                } else {
+                    Image(systemName: "photo").foregroundStyle(.secondary)
+                }
             }
             .clipped()
-            .task(id: url) {
-                guard let url else { image = nil; return }
-                let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                let key = "\(url.path)@\(date.timeIntervalSince1970)" as NSString
-                if let hit = Self.cache.object(forKey: key) { image = hit; return }
-                let img = await Task.detached(priority: .userInitiated) { UIImage(contentsOfFile: url.path)?.preparingForDisplay() }.value
-                if let img { Self.cache.setObject(img, forKey: key) }
-                image = img
+            .task(id: key) {
+                guard let url else { loaded = nil; return }
+                let image = await Self.loadImage(for: url, version: version)
+                guard !Task.isCancelled else { return }
+                if let image {
+                    let animate = animatedShotID != nil && !reduceMotion && loaded?.shotID != animatedShotID
+                    withAnimation(animate ? .easeOut(duration: 0.18) : nil) { loaded = (url, image, animatedShotID) }
+                } else if animatedShotID == nil {
+                    loaded = nil
+                }
             }
     }
 }
