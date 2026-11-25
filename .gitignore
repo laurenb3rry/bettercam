@@ -6,7 +6,6 @@ DerivedData/
 build/
 *.xcuserstate
 
-
 .claude/
 .tokensave/
 .serena/

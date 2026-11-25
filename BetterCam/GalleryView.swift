@@ -10,16 +10,41 @@ struct GalleryView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var picks: [PhotosPickerItem] = []
     @State private var importing = false
+    @State private var opened: Library.Shot?
+    @State private var selecting = false
+    @State private var selected: Set<String> = []
+    @State private var saving = false
+    @State private var confirmDelete = false
+    @State private var message: String?
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3), spacing: 2) {
                     ForEach(library.shots) { shot in
-                        NavigationLink(value: shot.id) {
+                        Button {
+                            if selecting {
+                                if selected.remove(shot.id) == nil { selected.insert(shot.id) }
+                            } else {
+                                opened = shot
+                            }
+                        } label: {
                             Thumb(url: library.thumb(shot.id), version: shot.version)
+                                .overlay(alignment: .bottomTrailing) {
+                                    if selecting {
+                                        Image(systemName: selected.contains(shot.id) ? "checkmark.circle.fill" : "circle")
+                                            .font(.title3.weight(.semibold))
+                                            .foregroundStyle(.white)
+                                            .background(.black.opacity(0.4), in: Circle())
+                                            .padding(6)
+                                    }
+                                }
                                 .task(id: shot.version) { await library.refreshThumbnail(shot.id) }
                         }
+                        .buttonStyle(.plain)
+                        .disabled(saving)
+                        .accessibilityLabel("Photo")
+                        .accessibilityAddTraits(selected.contains(shot.id) ? .isSelected : [])
                     }
                 }
             }
@@ -29,7 +54,24 @@ struct GalleryView: View {
                 }
             }
             .safeAreaInset(edge: .bottom) {
-                if library.processingCaptures > 0 {
+                if selecting {
+                    HStack {
+                        Button { Task { await saveSelection() } } label: {
+                            if saving { ProgressView() }
+                            else { Label("Save to Photos", systemImage: "square.and.arrow.up") }
+                        }
+                        Spacer()
+                        Text("\(selected.count) selected").font(.footnote).foregroundStyle(.secondary)
+                        Spacer()
+                        Button(role: .destructive) { confirmDelete = true } label: {
+                            Image(systemName: "trash")
+                        }
+                        .accessibilityLabel("Delete selected photos")
+                    }
+                    .disabled(selected.isEmpty || saving)
+                    .padding()
+                    .background(.regularMaterial)
+                } else if library.processingCaptures > 0 {
                     HStack(spacing: 8) {
                         ProgressView()
                         Text("Developing photo")
@@ -41,16 +83,43 @@ struct GalleryView: View {
             }
             .navigationTitle("Gallery")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationDestination(for: String.self) { PhotoView(id: $0) }
+            .fullScreenCover(item: $opened) { shot in
+                PhotoBrowser(id: shot.id).environmentObject(library)
+            }
+            .interactiveDismissDisabled(saving)
+            .alert("Delete \(selected.count) photos?", isPresented: $confirmDelete) {
+                Button("Delete", role: .destructive) {
+                    let failed = library.delete(selected)
+                    selected = failed
+                    if failed.isEmpty { selecting = false }
+                    else { message = "Couldn't delete \(failed.count) photos." }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This also deletes their originals from BetterCam.")
+            }
+            .alert(message ?? "", isPresented: Binding { message != nil } set: { if !$0 { message = nil } }) {
+                Button("OK") {}
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { dismiss() } label: { Image(systemName: "camera") }
+                    Button { dismiss() } label: { Image(systemName: "camera") }.disabled(saving)
                 }
-                ToolbarItem(placement: .topBarTrailing) { // import photos to apply the film looks after the fact
-                    PhotosPicker(selection: $picks, maxSelectionCount: 30, matching: .images) {
-                        if importing { ProgressView() } else { Image(systemName: "plus") }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if selecting {
+                        Button("Cancel") { selected.removeAll(); selecting = false }.disabled(saving)
+                    } else {
+                        Button("Select") { selecting = true }.disabled(library.shots.isEmpty || importing)
                     }
-                    .disabled(importing)
+                }
+                if !selecting {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        PhotosPicker(selection: $picks, maxSelectionCount: 30, matching: .images) {
+                            if importing { ProgressView() }
+                            else { Image(systemName: "plus") }
+                        }
+                        .disabled(importing)
+                    }
                 }
             }
             .onChange(of: picks) { _, items in
@@ -59,10 +128,9 @@ struct GalleryView: View {
                     importing = true
                     for item in items {
                         guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
-                        let types = item.supportedContentTypes
-                        await library.importPhoto(data,
-                                                  isRaw: types.contains { $0.conforms(to: .rawImage) },
-                                                  isHEIC: types.first?.conforms(to: .heic) == true)
+                        let source = CGImageSourceCreateWithData(data as CFData, nil)
+                        let format = source.flatMap(CGImageSourceGetType).flatMap { UTType($0 as String) }
+                        await library.importPhoto(data, format: format)
                     }
                     picks = []
                     importing = false
@@ -70,15 +138,71 @@ struct GalleryView: View {
             }
         }
     }
+    private func saveSelection() async {
+        guard !saving, !selected.isEmpty else { return }
+        saving = true
+        defer { saving = false }
+        var files: [URL] = []
+        defer { for file in files { try? FileManager.default.removeItem(at: file) } }
+        do {
+            try await PhotoExport.authorize()
+            for shot in library.shots where selected.contains(shot.id) {
+                let recipe = await library.load(shot.id)
+                files.append(try await PhotoExport.render(library.raw(shot.id), recipe: recipe))
+            }
+            guard files.count == selected.count else { throw PhotoExport.Failure.missing }
+            try await PhotoExport.save(files)
+            selected.removeAll()
+            selecting = false
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+}
+
+private struct PhotoBrowser: View {
+    @State var id: String
+    @EnvironmentObject private var library: Library
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            PhotoView(id: id, close: { dismiss() }, browse: browse)
+                .id(id)
+        }
+    }
+
+    private func browse(_ offset: Int) {
+        let shots = library.shots
+        guard let index = shots.firstIndex(where: { $0.id == id }),
+              shots.indices.contains(index + offset) else { return }
+        id = shots[index + offset].id
+    }
+}
+
+private enum PhotoSwipe {
+    case previous, next, close
+
+    init?(translation: CGPoint) {
+        let x = translation.x, y = translation.y
+        if abs(x) > max(45, abs(y)) {
+            self = x < 0 ? .next : .previous
+        } else if y > max(45, abs(x)) {
+            self = .close
+        } else {
+            return nil
+        }
+    }
 }
 
 struct PhotoView: View {
     let id: String
+    let close: () -> Void
+    let browse: (Int) -> Void
     @EnvironmentObject private var library: Library
-    @Environment(\.dismiss) private var dismiss
     @State private var recipe = Recipe()
     /// The photo's one development (guide-size base + analysis), shared by every look, slider, tile and export.
-    @State private var base: Task<(CIImage, Look.Analysis)?, Never>?
+    @State private var base: Task<CIImage?, Never>?
     @State private var deleted = false
     @State private var image: UIImage?
     @State private var displayedRecipe: Recipe?
@@ -86,6 +210,7 @@ struct PhotoView: View {
     @State private var loaded = false
     @State private var tool = Tool.film
     @State private var exporting = false
+    @State private var savedRecipe: Recipe?
     @State private var message: String?
     @State private var confirmDelete = false
     @State private var rendering = false
@@ -100,19 +225,41 @@ struct PhotoView: View {
         thumbnail ?? Thumb.cachedImage(for: library.thumb(id), version: shotVersion)
     }
 
+    private var regradeExposure: Double {
+        // Engine 3 included a fixed +1 EV in RAW decode, paired with the saved normalization.
+        recipe.engine == 3 && library.raw(id).pathExtension == "dng" ? recipe.baseExposure + Look.rawCompensation : 0
+    }
+
     private var canExport: Bool {
-        !exporting && !deleted && image != nil && displayedRecipe == recipe
+        recipe.profile != nil && !exporting && !deleted && image != nil && displayedRecipe == recipe
     }
 
     var body: some View {
         VStack(spacing: 16) {
             Group {
-                if let image, let shown = displayedRecipe {
-                    ZoomableImage(image: image, fullSize: fullSize, token: shown, detail: detail)
-                } else if missing {
-                    ContentUnavailableView("Can't open this photo", systemImage: "exclamationmark.triangle",
-                                           description: Text("Its original file is missing or unreadable."))
-                } else { ProgressView() }
+                if let photo = image ?? quickImage {
+                    ZoomableImage(image: photo, fullSize: displayedRecipe == nil ? nil : fullSize,
+                                  token: displayedRecipe, detail: detail, swipe: swipe)
+                } else {
+                    Group {
+                        if loaded, recipe.profile == nil {
+                            ContentUnavailableView("Saved grade unavailable", systemImage: "photo",
+                                description: Text("Choose a V1 look to develop the original."))
+                        } else if missing {
+                            ContentUnavailableView("Can't open this photo", systemImage: "exclamationmark.triangle",
+                                description: Text("Its original file is missing or unreadable."))
+                        } else {
+                            ProgressView()
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture().onEnded {
+                        if let direction = PhotoSwipe(translation: CGPoint(x: $0.translation.width, y: $0.translation.height)) {
+                            swipe(direction)
+                        }
+                    })
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -121,10 +268,15 @@ struct PhotoView: View {
                 case .film:
                     filterStrip
                 case .tone:
-                    slider("Exposure", $recipe.exposure, Recipe.exposureRange)
-                    slider("Contrast", $recipe.contrast, Recipe.contrastRange)
+                    Group {
+                        slider("Exposure", $recipe.exposure, Recipe.exposureRange)
+                        slider("Contrast", $recipe.contrast, Recipe.contrastRange)
+                    }.disabled(recipe.profile == nil)
                 case .color:
-                    if recipe.selectedFilter.grade.monochrome {
+                    if recipe.profile == nil {
+                        Text("Choose a V1 look to edit this photo.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else if recipe.isSilver {
                         Text("Color adjustments are available with color looks.")
                             .font(.caption).foregroundStyle(.secondary)
                     } else {
@@ -136,7 +288,7 @@ struct PhotoView: View {
             .frame(height: 150, alignment: .top)
             .disabled(!loaded || exporting)
             if let fullSize {
-                Text("\(Int(fullSize.width)) × \(Int(fullSize.height)) · \(library.raw(id).pathExtension == "dng" ? "RAW" : "HEIC")")
+                Text("\(Int(fullSize.width)) × \(Int(fullSize.height)) · \(library.raw(id).pathExtension == "heic" ? "HEIC" : "RAW")")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -147,27 +299,30 @@ struct PhotoView: View {
         }
         .padding()
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button(action: close) { Image(systemName: "chevron.left") }
+                    .accessibilityLabel("Back to Gallery")
+                    .disabled(exporting)
+            }
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button { Task { await export(share: false) } } label: { Label("Save to Photos", systemImage: "photo.badge.arrow.down") }
-                    Button { Task { await export(share: true) } } label: { Label("Share…", systemImage: "square.and.arrow.up") }
-                } label: {
-                    if exporting { ProgressView() } else { Image(systemName: "square.and.arrow.up") }
+                Button { Task { await export(share: false) } } label: {
+                    if exporting { ProgressView() }
+                    else { Image(systemName: savedRecipe == recipe ? "checkmark" : "square.and.arrow.up") }
                 }
-                .disabled(!canExport)
+                .accessibilityLabel(savedRecipe == recipe ? "Saved to Photos" : "Save to Photos")
+                .disabled(!canExport || savedRecipe == recipe)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
+                    Button { Task { await export(share: true) } } label: {
+                        Label("Share edited photo…", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(!canExport)
                     ShareLink(item: library.raw(id)) {
                         Label(library.raw(id).pathExtension == "dng" ? "Share RAW (DNG)" : "Share original", systemImage: "doc")
                     }
-                    Button("Reset edits") { recipe.resetSliders() }.disabled(!loaded || exporting)
-                    if loaded {
-                        // previous = revision 1 (Apple ProRAW profile + rev 27 grade); current = revision 2 engine
-                        Button(recipe.lookRevision < Filter.revision ? "Use current rendering" : "Use previous rendering") {
-                            recipe.lookRevision = recipe.lookRevision < Filter.revision ? Filter.revision : 1
-                        }.disabled(exporting)
-                    }
+                    Button("Reset edits") { recipe.resetSliders() }
+                        .disabled(!loaded || exporting || recipe.profile == nil)
                 } label: { Image(systemName: "ellipsis.circle") }
             }
             ToolbarItem(placement: .topBarTrailing) {
@@ -176,9 +331,12 @@ struct PhotoView: View {
         }
         .alert("Delete this photo?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
-                deleted = true
-                library.delete(id)
-                dismiss()
+                if library.delete([id]).isEmpty {
+                    deleted = true
+                    close()
+                } else {
+                    message = "Couldn't delete this photo."
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -206,8 +364,12 @@ struct PhotoView: View {
         }
         .onChange(of: recipe) { old, new in
             guard loaded, !deleted else { return }
-            if Look.sceneReferred(old) != Look.sceneReferred(new) { base = nil } // another development, not another grade
-            library.store(recipe, for: id)
+            guard new.profile != nil else { return }
+            if old.profile == nil { base = nil }
+            guard library.store(new, for: id) else {
+                recipe = library.recipe(id)
+                return
+            }
             let start = ProcessInfo.processInfo.systemUptime
             let changed = recipe
             Task {
@@ -221,7 +383,6 @@ struct PhotoView: View {
         .onDisappear {
             base = nil // release the development; the thumbnail pass re-reads the recipe
             guard loaded, !deleted else { return }
-            library.store(recipe, for: id)
             Task { await library.refreshThumbnail(id) }
         }
     }
@@ -241,19 +402,23 @@ struct PhotoView: View {
     /// VSCO-style strip: each tile shows *this* photo in that film look. Tap to apply.
     private var filterStrip: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if !Filter.all.contains(recipe.selectedFilter) {
-                Text("\(recipe.selectedFilter.name) · Saved look")
+            if recipe.profile == nil {
+                Text("Saved grade · Choose a V1 look to regrade")
                     .font(.caption).foregroundStyle(.secondary)
             }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
                     ForEach(Filter.all) { f in
-                        let on = recipe.selectedFilter == f
+                        let on = recipe.profile != nil && recipe.filter == f.id
                         Button {
                             if !on {
                                 var updated = recipe
-                                updated.filter = f.id
-                                updated.lookRevision = Filter.revision
+                                if recipe.profile == nil {
+                                    updated = Recipe(filter: f.id, crop: recipe.crop)
+                                    updated.baseExposure = regradeExposure
+                                } else {
+                                    updated.filter = f.id
+                                }
                                 recipe = updated
                             }
                         } label: {
@@ -275,7 +440,7 @@ struct PhotoView: View {
     }
 
     /// The development, once per open photo (look-independent: changing the look never re-decodes).
-    private func developed() async -> (CIImage, Look.Analysis)? {
+    private func developed() async -> CIImage? {
         if let base { return await base.value }
         let url = library.raw(id), r = recipe
         let task = Task { await library.developed(url, recipe: r) }
@@ -284,20 +449,18 @@ struct PhotoView: View {
     }
 
     private func renderPreviews() async {
-        var r = recipe
         let url = library.raw(id)
-        r.lookRevision = Filter.revision // the picker always shows the current looks, so their development
-        let current = Look.sceneReferred(r) == Look.sceneReferred(recipe)
-        guard let (base, analysis) = current ? await developed() : await library.developed(url, recipe: r) else { return }
-        var tile = r
+        var tile = recipe.profile == nil ? Recipe(filter: Filter.all[0].id, crop: recipe.crop) : recipe
+        if recipe.profile == nil { tile.baseExposure = regradeExposure }
         tile.resetSliders()
+        guard let base = await library.developed(url, recipe: tile) else { return }
         let small = Look.fit(base, 160)
         for filter in Filter.all {
             guard !Task.isCancelled, !deleted else { return }
             tile.filter = filter.id
             let recipe = tile
             let thumbnail = await Task.detached(priority: .utility) {
-                Look.uiImage(Look.apply(recipe, to: small, analysis: analysis, source: url))
+                Look.apply(recipe, to: small).flatMap(Look.uiImage)
             }.value
             guard !Task.isCancelled, !deleted else { return }
             previews[filter.id] = thumbnail
@@ -309,14 +472,13 @@ struct PhotoView: View {
         guard !rendering else { return }
         rendering = true
         defer { rendering = false }
-        let url = library.raw(id)
         while !deleted {
             let r = recipe
             var rendered: UIImage?
-            if let (base, analysis) = await developed() {
+            if r.profile != nil, let base = await developed() {
                 guard r == recipe else { continue }
                 rendered = await Task.detached(priority: .userInitiated) {
-                    Look.uiImage(Look.apply(r, to: base, analysis: analysis, source: url))
+                    Look.apply(r, to: base).flatMap(Look.uiImage)
                 }.value
             }
             guard r == recipe else { continue }
@@ -330,54 +492,84 @@ struct PhotoView: View {
 
     /// Native-resolution pixels for the zoomed region (`rect` in output pixels, top-left origin), same recipe and analysis.
     private func detail(_ rect: CGRect, _ scale: CGFloat) async -> UIImage? {
-        guard let r = displayedRecipe, let full = fullSize, let (_, analysis) = await developed() else { return nil }
+        guard let r = displayedRecipe, let full = fullSize else { return nil }
         let url = library.raw(id)
         let ci = CGRect(x: rect.minX, y: full.height - rect.maxY, width: rect.width, height: rect.height)
         return await Task.detached(priority: .userInitiated) {
-            Look.renderDetail(url, recipe: r, analysis: analysis, rect: ci, scale: scale).map { UIImage(cgImage: $0) }
+            Look.renderDetail(url, recipe: r, rect: ci, scale: scale).map { UIImage(cgImage: $0) }
         }.value
     }
 
-    /// Save to Photos and Share: the finished photograph developed from the original at native resolution, with the
-    /// editor's own analysis, so it is the rendering on screen. The original is only read, never written.
+    private func swipe(_ direction: PhotoSwipe) {
+        guard !exporting else { return }
+        switch direction {
+        case .previous: browse(-1)
+        case .next: browse(1)
+        case .close: close()
+        }
+    }
+
     private func export(share: Bool) async {
         guard canExport else { return }
         exporting = true
         defer { exporting = false }
-        let t0 = Date()
         let r = recipe, url = library.raw(id)
-        guard FileManager.default.fileExists(atPath: url.path) else { message = "This photo's original file is missing."; return }
-        let analysis = await developed()?.1
-        let file = Library.exportDir.appending(path: "bettercam-\(id)-\(UUID().uuidString).jpg")
-        let written = await Task.detached(priority: .userInitiated) {
-            do { try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true) }
-            catch { return false }
-            return Look.writeJPEG(url, recipe: r, analysis: analysis, to: file)
-        }.value
-        guard written else {
-            try? FileManager.default.removeItem(at: file)
-            message = "Couldn't render the photo. Try again."
-            return
-        }
-        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        diag.info("export JPEG ready in \(Date().timeIntervalSince(t0)) s, \(size) bytes, footprint \(Look.footprintMB()) MB")
-        if share {
-            shareURL = file
-            return
-        }
-        defer { try? FileManager.default.removeItem(at: file) }
-        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
-        guard status == .authorized || status == .limited else {
-            message = "Allow Photos access in Settings › bettercam to export."
-            return
-        }
         do {
-            try await PHPhotoLibrary.shared().performChanges {
-                PHAssetCreationRequest.forAsset().addResource(with: .photo, fileURL: file, options: nil)
+            if !share { try await PhotoExport.authorize() }
+            let file = try await PhotoExport.render(url, recipe: r)
+            if share {
+                shareURL = file
+            } else {
+                defer { try? FileManager.default.removeItem(at: file) }
+                try await PhotoExport.save([file])
+                savedRecipe = r
             }
-            message = "Saved to Photos."
         } catch {
             message = error.localizedDescription
+        }
+    }
+}
+
+@MainActor private enum PhotoExport {
+    enum Failure: LocalizedError {
+        case legacy
+        case missing, render, permission
+
+        var errorDescription: String? {
+            switch self {
+            case .legacy: "Choose a V1 look before exporting a photo with a saved V0 grade."
+            case .missing: "An original photo file is missing."
+            case .render: "Couldn't render the photo. Try again."
+            case .permission: "Allow Photos access in Settings › bettercam to export."
+            }
+        }
+    }
+
+    static func authorize() async throws {
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard status == .authorized || status == .limited else { throw Failure.permission }
+    }
+
+    static func render(_ url: URL, recipe: Recipe) async throws -> URL {
+        let file = Library.exportDir.appending(path: "bettercam-\(UUID().uuidString).jpg")
+        return try await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            guard recipe.profile != nil else { throw Failure.legacy }
+            guard fm.fileExists(atPath: url.path) else { throw Failure.missing }
+            try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard Look.writeJPEG(url, recipe: recipe, to: file) else {
+                try? fm.removeItem(at: file)
+                throw Failure.render
+            }
+            return file
+        }.value
+    }
+
+    static func save(_ files: [URL]) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            for file in files {
+                PHAssetCreationRequest.forAsset().addResource(with: .photo, fileURL: file, options: nil)
+            }
         }
     }
 }
@@ -385,23 +577,26 @@ struct PhotoView: View {
 /// The finished photograph, pinch- and double-tap-zoomable. Beyond the display image's own resolution it asks for the
 /// visible region at native resolution and lays it exactly over the same spot, so zooming shows real sensor detail in
 /// the same color and tone. A new `token` (recipe) drops the old detail.
-struct ZoomableImage: UIViewRepresentable {
+private struct ZoomableImage: UIViewRepresentable {
     let image: UIImage
     let fullSize: CGSize?
-    let token: Recipe
+    let token: Recipe?
     let detail: (CGRect, CGFloat) async -> UIImage?
+    let swipe: (PhotoSwipe) -> Void
 
     func makeUIView(context: Context) -> ZoomView { ZoomView() }
     func updateUIView(_ v: ZoomView, context: Context) {
         v.fullSize = fullSize
         v.detail = detail
+        v.swipe = swipe
         v.show(image, token: token)
     }
 
-    final class ZoomView: UIScrollView, UIScrollViewDelegate {
+    final class ZoomView: UIScrollView, UIScrollViewDelegate, UIGestureRecognizerDelegate {
         let content = UIView(), base = UIImageView(), tile = UIImageView()
         var fullSize: CGSize?
         var detail: ((CGRect, CGFloat) async -> UIImage?)?
+        var swipe: ((PhotoSwipe) -> Void)?
         private var token: Recipe?
         private var request: Task<Void, Never>?
         private var laidOut = CGSize.zero
@@ -419,10 +614,15 @@ struct ZoomableImage: UIViewRepresentable {
             let tap = UITapGestureRecognizer(target: self, action: #selector(doubleTap))
             tap.numberOfTapsRequired = 2
             addGestureRecognizer(tap)
+            let browse = UIPanGestureRecognizer(target: self, action: #selector(navigate))
+            browse.maximumNumberOfTouches = 1
+            browse.delegate = self
+            addGestureRecognizer(browse)
+            panGestureRecognizer.require(toFail: browse)
         }
         required init?(coder: NSCoder) { fatalError() }
 
-        func show(_ image: UIImage, token: Recipe) {
+        func show(_ image: UIImage, token: Recipe?) {
             if base.image !== image { base.image = image }
             if token != self.token { self.token = token; clearTile(); refreshDetail() }
         }
@@ -450,6 +650,18 @@ struct ZoomableImage: UIViewRepresentable {
         func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) { refreshDetail() }
         func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) { refreshDetail() }
         func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) { if !decelerate { refreshDetail() } }
+
+        override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            if gestureRecognizer !== panGestureRecognizer, gestureRecognizer is UIPanGestureRecognizer {
+                return zoomScale <= minimumZoomScale + 0.001
+            }
+            return super.gestureRecognizerShouldBegin(gestureRecognizer)
+        }
+
+        @objc private func navigate(_ gesture: UIPanGestureRecognizer) {
+            guard gesture.state == .ended, let direction = PhotoSwipe(translation: gesture.translation(in: self)) else { return }
+            swipe?(direction)
+        }
 
         @objc private func doubleTap(_ g: UITapGestureRecognizer) {
             if zoomScale > 1 { setZoomScale(1, animated: true); return }

@@ -2,7 +2,7 @@ import AVFoundation
 import os
 import SwiftUI
 
-/// Bayer by default, with ProRAW options where supported and HEIC on cameras without RAW.
+/// ProRAW by default, with Bayer and HEIC paths according to device capability.
 /// The viewfinder is the video feed run through the same Look engine as the photo, with the current filter.
 final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, AVCapturePhotoOutputReadinessCoordinatorDelegate {
     /// A native lens or a 2× view of the main sensor. Physical-input modes apply the crop during development.
@@ -19,10 +19,10 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     /// The viewfinder snapshot is only used while the original's thumbnail develops.
     struct Shot {
         let ext: String; let crop: Double; let filter: String; let exposure: Double
-        let grainSeed: UInt32?
         let captureID: Int64
         let delivered: TimeInterval
         let preview: CGImage?
+        var diagnostic: Diagnostics.Capture? = nil
     }
 
     /// One filtered viewfinder frame, tagged with the lens/mode generation it was rendered for.
@@ -89,6 +89,9 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     private var previewPending = false
     private var latestPreview: (image: CGImage, filter: String, exposure: Double, time: TimeInterval)?
     private var shutterPreviews: [Int64: CGImage] = [:]
+    private var diagnosticFrame: Diagnostics.Frame?             // lock-protected; only when Diagnostics.enabled
+    private var diagnosticShutter: [Int64: [String: Any]] = [:] // lock-protected
+    private var diagnosticFrames: [Int64: Diagnostics.Frame] = [:] // lock-protected
     private var selection = 0
     private var cropDeviceID: String?
     private var virtualRear: AVCaptureDevice?
@@ -106,11 +109,10 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     private var _filter = Filter.all[0].id
     private var _exposure = 0.0
     private var _paused = false
-    private var grainSeed = UInt32.random(in: .min ... .max)
     private var _crop = 1.0          // current stop's crop, read by the video queue
     private var _mode = Mode.standard
     private var _bias: Float = 0     // exposure target bias in effect; the viewfinder undoes it like decode does
-    private var _analysis: Look.Analysis?
+    private var _analyzeExposure = false
     private var generation = 0
     private var pending: [Int64: Pending] = [:] // per shot, by settings.uniqueID: back-to-back shots can't swap filters
     // camera queue
@@ -123,12 +125,8 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     // video queue
     private var frameCount = 0
     private var analyzing = false
-    private var trustGeneration = -1
-    private var trust = 0.0                  // viewfinder portrait pass strength, ramped (no pop when a person appears)
-    private var lastTrusted: Look.Analysis?  // keeps the pass alive through a few uncertain frames instead of flickering
-
     /// Viewfinder frame size, long side in pixels: about a phone screen's 3:4 area (1206–1320 pt wide × 3).
-    private static let previewSide: CGFloat = 1080
+    private static let previewSide: CGFloat = 1600
     /// Standard captures allowed in flight at once.
     private static let maxInFlight = 3
 
@@ -136,8 +134,8 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         let crop: Double, filter: String, exposure: Double, mode: Mode, proRAW: Bool, size48: Bool, label: String
         let pressed: TimeInterval; let requested: TimeInterval
         let request: String
-        let grainSeed: UInt32?
         let generation: Int
+        var device: [String: Any] = [:]   // capture device state at the request (diagnostics only)
     }
 
     func didDisplay(_ sample: PreviewSample) -> Bool {
@@ -147,7 +145,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     func start(preferred: String, mode: Mode) {
         lock.withLock { _mode = mode }
         readiness.delegate = self
-        Self.log.notice("render revision \(Look.version) recipe engine \(Recipe.engine)")
+        DispatchQueue.global(qos: .utility).async { Self.log.notice("\(Look.rendererDescription, privacy: .public)") }
         observeSession()
         AVCaptureDevice.requestAccess(for: .video) { ok in
             guard ok else {
@@ -229,16 +227,22 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             if conn.isVideoMirroringSupported { conn.automaticallyAdjustsVideoMirroring = false; conn.isVideoMirrored = stop.isFront }
         }
         // the seed the viewfinder showed, so the photo's grain is the pattern composed with; a fresh one for the next shot
-        let seed: UInt32? = Filter.named(filter).grade.grain > 0 ? lock.withLock {
-            defer { grainSeed = UInt32.random(in: .min ... .max) }
-            return grainSeed
-        } : nil
         let dimensions = settings.maxPhotoDimensions
         let request = "mode=\(mode.rawValue) requestedMax=\(dimensions.width)x\(dimensions.height) requestedFourCC=\(Self.fourCC(settings.rawPhotoPixelFormatType)) camera=\(stop.device.deviceType.rawValue)"
         let requested = ProcessInfo.processInfo.systemUptime
         let p = Pending(crop: usesVirtualRear ? 1 : stop.crop, filter: filter, exposure: exposure, mode: mode, proRAW: settingsAreProRAW(settings),
-                        size48: size48, label: stop.label, pressed: pressed, requested: requested, request: request, grainSeed: seed, generation: lock.withLock { generation })
-        lock.withLock { pending[settings.uniqueID] = p }
+                        size48: size48, label: stop.label, pressed: pressed, requested: requested, request: request, generation: lock.withLock { generation })
+        var request0 = p
+        if Diagnostics.enabled, let d = input?.device {
+            let wb = d.deviceWhiteBalanceGains
+            let tt = d.temperatureAndTintValues(for: wb)
+            request0.device = ["exposureDuration": d.exposureDuration.seconds, "iso": d.iso, "targetBias": d.exposureTargetBias,
+                               "targetOffset": d.exposureTargetOffset, "wbGains": [wb.redGain, wb.greenGain, wb.blueGain],
+                               "wbTemperature": tt.temperature, "wbTint": tt.tint, "lensPosition": d.lensPosition,
+                               "device": d.deviceType.rawValue, "format": "\(d.activeFormat.formatDescription.dimensions)",
+                               "requestUptime": requested]
+        }
+        lock.withLock { pending[settings.uniqueID] = request0 }
         readiness.startTrackingCaptureRequest(using: settings)
         Self.log.info("capture \(settings.uniqueID) tap to request \((requested - pressed) * 1000) ms")
         output.capturePhoto(with: settings, delegate: self)
@@ -410,7 +414,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             zoomStarted = tap
             generation += 1
             latestPreview = nil
-            if switchingDevice || formatChanged { _analysis = nil }
+            _analyzeExposure = shootsBayer
         }
         if switchingDevice || formatChanged {
             setBias(device, initialBias())
@@ -504,9 +508,9 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     /// - < 0.2% there and the brightest 0.1% below 80% of video white for ~1 s → ⅓ stop more light (up to 0: indoor
     ///   shadows, flat daylight, low light), never brighter in the rendered photo, only cleaner.
     /// The gap between the two thresholds is the hysteresis: a steady scene never oscillates.
-    private func updateBias(_ a: Look.Analysis) {
+    private func updateBias(highlightShare: Double, peak: Double) {
         guard adaptiveBias, let d = active?.device else { return }
-        let vote = a.highlightShare > 0.02 ? -1 : (a.highlightShare < 0.002 && a.peak < 0.8 ? 1 : 0)
+        let vote = highlightShare > 0.02 ? -1 : (highlightShare < 0.002 && peak < 0.8 ? 1 : 0)
         biasStreak = vote == biasVote ? biasStreak + 1 : 1
         biasVote = vote
         guard vote != 0, biasStreak >= 4 else { return }
@@ -556,14 +560,6 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
 
     fileprivate static let log = Logger(subsystem: "bettercam", category: "capture")
 
-    /// EV100 from a video frame's EXIF attachment (same formula as Look.sceneEV for files); nil if the frame has none.
-    private static func sceneEV(_ sb: CMSampleBuffer) -> Double? {
-        guard let x = CMGetAttachment(sb, key: kCGImagePropertyExifDictionary as CFString, attachmentModeOut: nil) as? [String: Any],
-              let n = x[kCGImagePropertyExifFNumber as String] as? Double, let t = x[kCGImagePropertyExifExposureTime as String] as? Double,
-              let iso = (x[kCGImagePropertyExifISOSpeedRatings as String] as? [Double])?.first, n > 0, t > 0, iso > 0 else { return nil }
-        return log2(n * n / t) - log2(iso / 100)
-    }
-
     private static func zoom(_ d: AVCaptureDevice, relativeTo wide: AVCaptureDevice) -> Double {
         func halfTan(_ x: AVCaptureDevice) -> Double { tan(Double(x.activeFormat.videoFieldOfView) * .pi / 360) }
         return halfTan(wide) / halfTan(d)
@@ -579,6 +575,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
                ProcessInfo.processInfo.systemUptime - preview.time < 0.25 {
                 shutterPreviews[id] = preview.image
             }
+            if Diagnostics.enabled, let frame = diagnosticFrame { diagnosticFrames[id] = frame }
         }
         DispatchQueue.main.async { self.shutterCount += 1 }
     }
@@ -594,7 +591,9 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         let id = photo.resolvedSettings.uniqueID
         let callback = ProcessInfo.processInfo.systemUptime
-        let (request, sensor, preview) = lock.withLock { (pending[id], sensorTimes[id], shutterPreviews.removeValue(forKey: id)) }
+        let (request, sensor, preview, frame) = lock.withLock {
+            (pending[id], sensorTimes[id], shutterPreviews.removeValue(forKey: id), diagnosticFrames.removeValue(forKey: id))
+        }
         guard let p = request else { return }
         guard error == nil, let data = photo.fileDataRepresentation() else {
             return fail("The photo couldn't be captured: \(error?.localizedDescription ?? "no image data"). Try again.")
@@ -635,8 +634,24 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             fail("\(mismatch). The photo was saved as delivered.")
         }
         guard let onCapture else { return }
-        let shot = Shot(ext: photo.isRawPhoto ? "dng" : "heic", crop: p.crop, filter: p.filter,
-                        exposure: p.exposure, grainSeed: p.grainSeed, captureID: id, delivered: delivered, preview: preview)
+        var shot = Shot(ext: photo.isRawPhoto ? "dng" : "heic", crop: p.crop, filter: p.filter,
+                        exposure: p.exposure, captureID: id, delivered: delivered, preview: preview)
+        if Diagnostics.enabled {
+            // Comparability evidence: frame age, both exposures and WB; never assume the preview matches the still.
+            var info: [String: Any] = ["captureID": id, "request": p.request, "stop": p.label, "crop": p.crop,
+                "mode": p.mode.rawValue, "filter": p.filter, "userEV": p.exposure, "proRAWRequested": p.proRAW,
+                "size48Requested": p.size48, "deliveredProRAW": isProRAW, "delivered": "\(dims.width)x\(dims.height)",
+                "photoPTS": photo.timestamp.seconds, "orientation": Diagnostics.plain(photo.metadata[kCGImagePropertyOrientation as String]),
+                "stillExif": Diagnostics.plain(exif), "stillDNG": Diagnostics.plain(dng?.filter { !["ProfileHueSatMapData1", "ProfileHueSatMapData2", "ProfileLookTableData", "ProfileToneCurve", "DNGPrivateData"].contains($0.key) }),
+                "deviceAtRequest": Diagnostics.plain(p.device),
+                "timings": ["pressed": p.pressed, "requested": p.requested, "sensor": sensor ?? -1, "processed": callback, "delivered": delivered]]
+            if let frame {
+                info["preview"] = Diagnostics.plain(frame.info)
+                info["previewPTS"] = frame.pts
+                info["previewAgeSeconds"] = photo.timestamp.seconds - frame.pts
+            }
+            shot.diagnostic = Diagnostics.Capture(ungraded: frame?.ungraded, graded: frame?.graded, info: info)
+        }
         lock.withLock { _ = writing.insert(id) }
         Task {
             await onCapture(shot, data)
@@ -651,6 +666,7 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             pending[resolvedSettings.uniqueID] = nil
             sensorTimes[resolvedSettings.uniqueID] = nil
             shutterPreviews[resolvedSettings.uniqueID] = nil
+            diagnosticFrames[resolvedSettings.uniqueID] = nil
         }
         updateBusy()
     }
@@ -677,13 +693,8 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
             img = img.transformed(by: CGAffineTransform(translationX: -img.extent.minX, y: -img.extent.minY))
         }
         // 2× stop: crop the full-resolution frame first, so the crop keeps real detail (scaling a small frame up didn't)
-        let (k, bias, ev, filter, generation, seed) = lock.withLock {
-            (_crop, Double(_bias), _exposure, _filter, self.generation, grainSeed)
-        }
-        if trustGeneration != generation {
-            trustGeneration = generation
-            trust = 0
-            lastTrusted = nil
+        let (k, bias, ev, filter, generation, analyzeExposure) = lock.withLock {
+            (_crop, Double(_bias), _exposure, _filter, self.generation, _analyzeExposure)
         }
         if k > 1 {
             let e = img.extent, w = e.width / k, h = e.height / k
@@ -692,23 +703,14 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         }
         // ISP-processed video is the reference for this frame's RAW development.
         let s = min(1, Self.previewSide / max(img.extent.width, img.extent.height))
-        var props: [String: Any] = [Look.clipKey: pow(2, -bias)] // 8-bit video white, after the bias gain below
-        let sceneEV = Self.sceneEV(sb)
-        props[Look.evKey] = sceneEV // same EV100 the saved photo's EXIF gives: light-dependent looks match the final
         img = img.transformed(by: CGAffineTransform(scaleX: s, y: s))
-            // frames are underexposed by the capture bias, like the DNG before decode: restore the same way
-            .applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -bias])
-            .settingProperties(props)
         frameCount += 1
-        let current = lock.withLock { _analysis }
-        let analysis = current ?? Look.Analysis(wb: (1, 1, 1), clip: pow(2, -bias), sceneEV: sceneEV)
-        if !analyzing, current == nil || frameCount % 12 == 0 { analyzeAsync(img, generation: generation) }
-        var r = Recipe(filter: filter)
-        r.exposure = ev
-        if Filter.named(filter).grade.grain > 0 { r.grainSeed = seed }
-        // Lightweight approximation of the photograph: the same look, grade and output transform on Apple's video frame
-        // (which already carries the ISP's own local tone mapping, so the still's local development isn't repeated here).
-        let out = Look.apply(r, to: img, analysis: analysis)
+        if analyzeExposure, !analyzing, frameCount % 12 == 0 {
+            analyzeAsync(img, generation: generation)
+        }
+        var recipe = Recipe(filter: filter)
+        recipe.exposure = ev - bias
+        guard let out = Look.apply(recipe, to: Look.adaptPreview(img)) else { return }
         if let cg = Look.previewContext.createCGImage(out, from: out.extent, format: .RGBA8, colorSpace: Look.outputSpace) {
             guard lock.withLock({
                 guard self.generation == generation else { return false }
@@ -720,6 +722,15 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
                 previewPending = true
                 return true
             }) else { return }
+            if Diagnostics.enabled, frameCount % 4 == 0, let ungraded = Look.previewContext.createCGImage(img, from: img.extent, format: .RGBA8, colorSpace: Look.outputSpace) {
+                let attachments = CMCopyDictionaryOfAttachments(allocator: nil, target: sb, attachmentMode: kCMAttachmentMode_ShouldPropagate) as? [String: Any]
+                let frame = Diagnostics.Frame(ungraded: ungraded, graded: cg, pts: CMSampleBufferGetPresentationTimeStamp(sb).seconds, uptime: now,
+                    info: ["exif": Diagnostics.plain(attachments?[kCGImagePropertyExifDictionary as String]), "filter": filter,
+                           "renderEV": ev - bias, "userEV": ev, "targetBias": bias, "crop": k, "size": "\(Int(img.extent.width))x\(Int(img.extent.height))",
+                           "pixelFormat": Self.fourCC(CVPixelBufferGetPixelFormatType(pb)), "domain": "ISP video, display-referred",
+                           "lookVersion": Look.version, "gradeRevision": Grade.revision])
+                lock.withLock { diagnosticFrame = frame }
+            }
             #if DEBUG
             if saveReferenceFrame, frameCount >= 24 {
                 saveReferenceFrame = false
@@ -740,37 +751,30 @@ final class Camera: NSObject, ObservableObject, AVCapturePhotoCaptureDelegate, A
         }
     }
 
-    /// The viewfinder's analysis, off the video queue (~7×/s): white balance, highlight statistics and, unless the phone is
-    /// hot, the Vision person mask + faces, so face lift, background tone and skin chroma show live like in the saved photo.
-    /// The portrait pass ramps in over ~0.5 s and survives a few uncertain frames, so it neither pops nor flickers.
     private func analyzeAsync(_ img: CIImage, generation: Int) {
         analyzing = true
-        let hot = ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
         analysisQueue.async {
-            var a = Look.analyze(img, subject: !hot)
+            let guide = Look.fit(img, 96)
+            let bounds = guide.extent.integral
+            let width = Int(bounds.width), height = Int(bounds.height)
+            var pixels = [Float](repeating: 0, count: width * height * 4)
+            Look.context.render(guide, toBitmap: &pixels, rowBytes: width * 16, bounds: bounds,
+                                format: .RGBAf, colorSpace: Look.workingSpace)
+            let maxima = stride(from: 0, to: pixels.count, by: 4)
+                .map { max(pixels[$0], pixels[$0 + 1], pixels[$0 + 2]) }.sorted()
             self.videoQueue.async {
                 self.analyzing = false
-                guard self.lock.withLock({ self.generation == generation }) else { return }
-                if a.maskTrusted {
-                    self.lastTrusted = a
-                    self.trust = min(1, self.trust + 0.25)
-                } else if let t = self.lastTrusted, self.trust > 0 {
-                    self.trust = max(0, self.trust - 0.2)
-                    a.subjectMask = t.subjectMask; a.faces = t.faces; a.maskTrusted = true
-                    a.subjectGap = t.subjectGap; a.faceGap = t.faceGap; a.skinTarget = t.skinTarget
-                } else {
-                    self.lastTrusted = nil
-                }
-                a.selectiveStrength = self.trust
-                self.lock.withLock { if self.generation == generation { self._analysis = a } }
+                guard !maxima.isEmpty else { return }
+                let peak = Double(maxima[Int(0.999 * Double(maxima.count))])
+                let clipped = maxima.count - (maxima.firstIndex { $0 >= 0.97 } ?? maxima.count)
+                let highlightShare = Double(clipped) / Double(maxima.count)
                 self.queue.async {
                     guard self.lock.withLock({ self.generation == generation }) else { return }
-                    self.updateBias(a)
+                    self.updateBias(highlightShare: highlightShare, peak: peak)
                 }
             }
         }
     }
-
 }
 
 extension Camera.Shot {
@@ -778,9 +782,7 @@ extension Camera.Shot {
     var provisionalRecipe: Recipe {
         var r = Recipe(filter: filter, crop: crop)
         r.exposure = min(max(exposure, Recipe.exposureRange.lowerBound), Recipe.exposureRange.upperBound)
-        r.grainSeed = grainSeed
         if ext == "dng" {
-            r.baseExposure = -Look.rawCompensation
             r.pendingCaptureExposure = true
         }
         return r

@@ -102,6 +102,7 @@ struct CameraView: View {
             GalleryView().environmentObject(library) // swipe down = back to camera; the session keeps running
         }
         .onChange(of: filterID, initial: true) { _, id in
+            if Filter.migrated(id) != id { filterID = Filter.migrated(id); return }
             guard Filter.all.contains(where: { $0.id == id }) else {
                 filterID = Filter.all[0].id
                 camera.filter = filterID

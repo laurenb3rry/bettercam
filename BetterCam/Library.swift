@@ -2,6 +2,7 @@ import CoreImage
 import Foundation
 import os
 import UIKit
+import UniformTypeIdentifiers
 
 /// The in-app gallery: originals (DNG, or HEIC from a camera without RAW) + recipe + rendered thumbnail, in Documents/Shots.
 /// Nothing is ever auto-deleted; originals are written once and never modified (edits live in the recipe JSON).
@@ -19,14 +20,13 @@ final class Library: ObservableObject {
     private let dir = URL.documentsDirectory.appending(path: "Shots")
     private let fm = FileManager.default
     private static let log = Logger(subsystem: "bettercam", category: "library")
-    private var recent: (url: URL, crop: Double, exposure: Double, scene: Bool, image: CIImage, analysis: Look.Analysis)?
+    private var recent: (url: URL, crop: Double, exposure: Double, image: CIImage)?
     private struct DevelopmentKey: Hashable {
         let url: URL
         let crop: Double
         let exposure: Double
-        let scene: Bool
     }
-    private var developments: [DevelopmentKey: Task<(CIImage, Look.Analysis)?, Never>] = [:]
+    private var developments: [DevelopmentKey: Task<CIImage?, Never>] = [:]
     private var pendingRecipes: [String: Task<Recipe, Never>] = [:]
     private var thumbnailsInFlight: Set<String> = []
     private var savingIDs: Set<String> = []
@@ -39,12 +39,14 @@ final class Library: ObservableObject {
 
     func raw(_ id: String) -> URL {
         let dng = dir.appending(path: "\(id).dng")
-        return fm.fileExists(atPath: dng.path) ? dng : dir.appending(path: "\(id).heic")
+        if fm.fileExists(atPath: dng.path) { return dng }
+        let nativeRAW = dir.appending(path: "\(id).raw")
+        return fm.fileExists(atPath: nativeRAW.path) ? nativeRAW : dir.appending(path: "\(id).heic")
     }
     func thumb(_ id: String) -> URL {
         let current = currentThumb(id)
-        if fm.fileExists(atPath: current.path) { return current }
-        for version in [28, 27, 25, 24] {
+        if recipe(id).profile != nil, fm.fileExists(atPath: current.path) { return current }
+        for version in [33, 32, 31, 29, 28, 27, 25, 24] {
             let previous = dir.appending(path: "\(id).v\(version).jpg")
             if fm.fileExists(atPath: previous.path) { return previous }
         }
@@ -85,20 +87,21 @@ final class Library: ObservableObject {
                 processingCaptures -= 1
             }
             let result = await Self.develop(priority: .veryHigh) {
-                Look.captureDevelopment(dst, recipe: provisional).map { recipe, guide, analysis in
-                    let image = Look.apply(recipe, to: Look.fit(guide, 600), analysis: analysis, source: dst)
-                    let jpeg = Look.jpeg(image)
-                    return (recipe, guide, analysis, jpeg, jpeg.flatMap { UIImage(data: $0)?.preparingForDisplay() })
-                }
+                let recipe = Look.normalizeCapture(provisional, source: dst)
+                guard let guide = Look.photo(dst, recipe: recipe),
+                      let image = Look.apply(recipe, to: Look.fit(guide, 600)),
+                      let jpeg = Look.jpeg(image) else { return nil as (Recipe, CIImage, Data, UIImage?)? }
+                return (recipe, guide, jpeg, UIImage(data: jpeg)?.preparingForDisplay())
             }
             guard fm.fileExists(atPath: dst.path) else { return provisional }
-            guard let (recipe, guide, analysis, jpeg, prepared) = result else {
+            guard let (recipe, guide, jpeg, prepared) = result else {
                 message = "The original was saved, but its thumbnail couldn't be rendered."
                 return provisional
             }
-            writeRecipe(recipe, id)
-            if let jpeg, publishThumbnail(jpeg, for: id, prepared: prepared) {
-                if shots.first?.id == id { recent = (dst, recipe.crop, recipe.baseExposure, Look.sceneReferred(recipe), guide, analysis) }
+            guard writeRecipe(recipe, id) else { return provisional }
+            if let diagnostic = shot.diagnostic { Diagnostics.save(diagnostic, source: dst, libraryID: id, recipe: recipe, guide: guide) }
+            if publishThumbnail(jpeg, for: id, prepared: prepared) {
+                if shots.first?.id == id { recent = (dst, recipe.crop, recipe.baseExposure, guide) }
                 Self.log.info("capture \(captureID) disk to thumbnail published \((ProcessInfo.processInfo.systemUptime - persisted) * 1000) ms")
             } else {
                 message = "The original was saved, but its thumbnail couldn't be saved."
@@ -115,74 +118,47 @@ final class Library: ObservableObject {
     }
 
     /// Import from the photo library. RAW (DNG/ProRAW) is kept as-is; HEIC as-is; anything else (JPEG, PNG) → HEIC.
-    func importPhoto(_ data: Data, isRaw: Bool, isHEIC: Bool) async {
+    func importPhoto(_ data: Data, format: UTType?) async {
         let id = newID()
         savingIDs.insert(id)
         defer { savingIDs.remove(id) }
-        let dst = dir.appending(path: "\(id).\(isRaw ? "dng" : "heic")")
+        let isRaw = format?.conforms(to: .rawImage) == true
+        let ext = format?.preferredFilenameExtension == "dng" ? "dng" : (isRaw ? "raw" : "heic")
+        let dst = dir.appending(path: "\(id).\(ext)")
         let ok = await Task.detached(priority: .userInitiated) { () -> Bool in
-            if isRaw || isHEIC { return (try? data.write(to: dst, options: .atomic)) != nil }
+            if isRaw || format?.conforms(to: .heic) == true { return (try? data.write(to: dst, options: .atomic)) != nil }
             guard let img = CIImage(data: data, options: [.applyOrientationProperty: true]), let heic = Look.heif(img) else { return false }
             return (try? heic.write(to: dst, options: .atomic)) != nil
         }.value
         guard ok else { message = "A photo couldn't be imported."; return }
-        var r = Recipe()
-        // imported RAWs weren't shot 1 stop under like ours: undo the decode's compensation (+ ProRAW exposure)
-        if isRaw { r.baseExposure = -Look.rawCompensation }
+        let r = Recipe()
         writeRecipe(r, id)
         let rendered = await renderThumb(id, r)
         savingIDs.remove(id)
-        if !rendered { reload() }
+        if !rendered {
+            reload()
+            message = "The original was imported, but it couldn't be developed."
+        }
     }
 
     private func newID() -> String {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss-SSS"
         var id = f.string(from: .now), n = 1
-        while savingIDs.contains(id) || ["json", "dng", "heic"].contains(where: { fm.fileExists(atPath: dir.appending(path: "\(id).\($0)").path) }) {
+        while savingIDs.contains(id) || ["json", "dng", "raw", "heic"].contains(where: { fm.fileExists(atPath: dir.appending(path: "\(id).\($0)").path) }) {
             id = f.string(from: .now) + "-\(n)"; n += 1
         }
         return id
     }
 
-    /// The recipe, migrated to the current engine if needed (once, saved). Engine 1 recipes keep their look, sliders, crop
-    /// and grain; a fitted preview match is replaced by the file's own exposure normalization. The engine 1 JSON is kept
-    /// beside the original (`<id>.engine1.json`), so nothing about the old rendering is lost.
     func load(_ id: String) async -> Recipe {
-        if let pending = pendingRecipes[id] { return await pending.value }
-        var r = recipe(id)
+        if let pending = pendingRecipes[id] { _ = await pending.value }
+        let recipe = recipe(id)
+        guard recipe.profile != nil, recipe.pendingCaptureExposure == true else { return recipe }
         let url = raw(id)
-        guard r.engine < Recipe.engine || r.pendingCaptureExposure == true,
-              fm.fileExists(atPath: url.path) else { return r }
-        if r.engine < Recipe.engine {
-            let backup = dir.appending(path: "\(id).engine1.json")
-            if !fm.fileExists(atPath: backup.path) { try? fm.copyItem(at: recipeURL(id), to: backup) }
-        }
-        if r.needsExposure || r.pendingCaptureExposure == true {
-            let original = r
-            let exposure = await Self.develop {
-                guard url.pathExtension == "dng", !Look.isProRAW(url) else { return 0.0 }
-                return -Look.rawCompensation - Look.captureBias(url)
-            }
-            let current = recipe(id)
-            guard current == original else { return current }
-            r.baseExposure = exposure
-        }
-        // Engine 3: revision 2 develops ProRAW from scene light, so it needs the file's exposure normalization (Apple's
-        // metering, Look.proRAWExposure). Revision ≤ 1 ignores baseExposure for ProRAW, so old renderings don't change.
-        if r.engine < 3, url.pathExtension.lowercased() == "dng" {
-            let original = r
-            let exposure = await Self.develop { Look.isProRAW(url) ? Look.startingExposure(url, captured: true) : nil }
-            let current = recipe(id)
-            guard current.lookRevision == original.lookRevision, current.filter == original.filter else { return current }
-            if let exposure { r.baseExposure = exposure }
-        }
-        guard fm.fileExists(atPath: url.path) else { return r }
-        r.pendingCaptureExposure = nil
-        r.needsExposure = false
-        r.engine = Recipe.engine
-        writeRecipe(r, id)
-        return r
+        let normalized = await Self.develop { Look.normalizeCapture(recipe, source: url) }
+        guard self.recipe(id) == recipe, fm.fileExists(atPath: url.path) else { return self.recipe(id) }
+        return writeRecipe(normalized, id) ? normalized : recipe
     }
 
     /// Heavy background development (thumbnails, migration, new captures) runs one job at a time: a burst of 48 MP
@@ -206,26 +182,52 @@ final class Library: ObservableObject {
     }
 
     func recipe(_ id: String) -> Recipe {
-        (try? Data(contentsOf: recipeURL(id))).flatMap { try? JSONDecoder().decode(Recipe.self, from: $0) } ?? Recipe()
+        if let data = try? Data(contentsOf: recipeURL(id)),
+           let recipe = try? JSONDecoder().decode(Recipe.self, from: data) { return recipe }
+        // An original without a readable recipe must never acquire a new look silently.
+        var legacy = Recipe(filter: "editorial")
+        legacy.engine = 0
+        legacy.lookRevision = 0
+        return legacy
     }
 
-    private func writeRecipe(_ r: Recipe, _ id: String) {
-        do { try JSONEncoder().encode(r).write(to: recipeURL(id), options: .atomic) } catch {
+    @discardableResult
+    private func writeRecipe(_ r: Recipe, _ id: String) -> Bool {
+        do {
+            try JSONEncoder().encode(r).write(to: recipeURL(id), options: .atomic)
+            return true
+        } catch {
             message = "Your edits couldn't be saved: \(error.localizedDescription)"
+            return false
         }
     }
 
-    /// Edits as they happen (cheap: the JSON only), so nothing is lost if the app is closed mid-edit.
-    func store(_ r: Recipe, for id: String) {
-        guard fm.fileExists(atPath: raw(id).path), r != recipe(id) else { return }
-        writeRecipe(r, id)
+    @discardableResult
+    func store(_ r: Recipe, for id: String) -> Bool {
+        let previous = recipe(id)
+        guard r.profile != nil, fm.fileExists(atPath: raw(id).path) else { return false }
+        guard r != previous else { return true }
+        if previous.profile == nil {
+            do {
+                for (source, suffix) in [(recipeURL(id), "v0.json"), (thumb(id), "v0.jpg")] {
+                    let backup = dir.appending(path: "\(id).\(suffix)")
+                    if fm.fileExists(atPath: source.path), !fm.fileExists(atPath: backup.path) {
+                        try Data(contentsOf: source).write(to: backup, options: .atomic)
+                    }
+                }
+            } catch {
+                message = "Couldn’t preserve the previous grade: \(error.localizedDescription)"
+                return false
+            }
+        }
+        return writeRecipe(r, id)
     }
 
     /// Leaving the editor: refresh the thumbnail from the saved recipe.
     func refreshThumbnail(_ id: String) async {
         guard !Task.isCancelled else { return }
         guard fm.fileExists(atPath: raw(id).path) else { return }
-        guard !savingIDs.contains(id), thumbnailNeedsRefresh(id),
+        guard recipe(id).profile != nil, !savingIDs.contains(id), thumbnailNeedsRefresh(id),
               thumbnailsInFlight.insert(id).inserted else { return }
         defer { thumbnailsInFlight.remove(id) }
         _ = await renderThumb(id, await load(id))
@@ -239,21 +241,36 @@ final class Library: ObservableObject {
         return (recipeDate ?? .distantPast) > thumbnailDate
     }
 
-    func delete(_ id: String) {
-        if recent?.url == raw(id) { recent = nil }
-        try? fm.removeItem(at: currentThumb(id))
-        for version in [28, 27, 25, 24] { try? fm.removeItem(at: dir.appending(path: "\(id).v\(version).jpg")) }
-        try? fm.removeItem(at: Look.shutterURL(for: raw(id)))
-        try? fm.removeItem(at: Look.previewURL(for: raw(id)))
-        for ext in ["dng", "heic", "jpg", "json", "engine1.json"] { try? fm.removeItem(at: dir.appending(path: "\(id).\(ext)")) }
+    func delete(_ ids: Set<String>) -> Set<String> {
+        var failed: Set<String> = []
+        for id in ids {
+            let original = raw(id)
+            do {
+                if fm.fileExists(atPath: original.path) { try fm.removeItem(at: original) }
+            } catch {
+                failed.insert(id)
+                continue
+            }
+            if recent?.url == original { recent = nil }
+            try? fm.removeItem(at: currentThumb(id))
+            for version in [50, 33, 32, 31, 29, 28, 27, 25, 24] where version != Look.version {
+                try? fm.removeItem(at: dir.appending(path: "\(id).v\(version).jpg"))
+            }
+            try? fm.removeItem(at: Look.shutterURL(for: original))
+            try? fm.removeItem(at: Look.previewURL(for: original))
+            for ext in ["jpg", "json", "engine1.json", "v0.json", "v0.jpg", "photographic-r3.jpg"] {
+                try? fm.removeItem(at: dir.appending(path: "\(id).\(ext)"))
+            }
+        }
         reload()
+        return failed
     }
 
     private func reload() {
         let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         let published = Dictionary(uniqueKeysWithValues: shots.map { ($0.id, $0) })
         shots = files
-            .filter { ["dng", "heic"].contains($0.pathExtension) }
+            .filter { ["dng", "raw", "heic"].contains($0.pathExtension) }
             .map { $0.deletingPathExtension().lastPathComponent }
             .filter { !savingIDs.contains($0) || published[$0] != nil }
             .sorted(by: >)
@@ -264,19 +281,18 @@ final class Library: ObservableObject {
             }
     }
 
-    func developed(_ url: URL, recipe: Recipe, priority: Operation.QueuePriority = .high) async -> (CIImage, Look.Analysis)? {
-        let scene = Look.sceneReferred(recipe)
-        let key = DevelopmentKey(url: url, crop: recipe.crop, exposure: recipe.baseExposure, scene: scene)
-        if let recent, recent.url == url, recent.crop == recipe.crop, recent.exposure == recipe.baseExposure, recent.scene == scene {
-            return (recent.image, recent.analysis)
+    func developed(_ url: URL, recipe: Recipe, priority: Operation.QueuePriority = .high) async -> CIImage? {
+        guard recipe.profile != nil else { return nil }
+        let key = DevelopmentKey(url: url, crop: recipe.crop, exposure: recipe.baseExposure)
+        if let recent, recent.url == url, recent.crop == recipe.crop, recent.exposure == recipe.baseExposure {
+            return recent.image
         }
         if let task = developments[key] { return await task.value }
-        guard !Task.isCancelled else { return nil }
-        let task = Task { await Self.develop(priority: priority) { Look.photo(url, recipe: recipe, maxSide: Look.guideSide) } }
+        let task = Task { await Self.develop(priority: priority) { Look.photo(url, recipe: recipe) } }
         developments[key] = task
         let photo = await task.value
-        if let (base, analysis) = photo, shots.first?.id == url.deletingPathExtension().lastPathComponent {
-            recent = (url, recipe.crop, recipe.baseExposure, scene, base, analysis)
+        if let photo, shots.first?.id == url.deletingPathExtension().lastPathComponent {
+            recent = (url, recipe.crop, recipe.baseExposure, photo)
         }
         developments[key] = nil
         return photo
@@ -284,9 +300,10 @@ final class Library: ObservableObject {
 
     private func renderThumb(_ id: String, _ recipe: Recipe) async -> Bool {
         let src = raw(id)
-        guard fm.fileExists(atPath: src.path), let (base, analysis) = await developed(src, recipe: recipe, priority: .low), !Task.isCancelled else { return false }
+        guard fm.fileExists(atPath: src.path), let base = await developed(src, recipe: recipe, priority: .low),
+              !Task.isCancelled else { return false }
         let data = await Self.develop(priority: .low) {
-            Look.jpeg(Look.apply(recipe, to: Look.fit(base, 600), analysis: analysis, source: src))
+            Look.apply(recipe, to: Look.fit(base, 600)).flatMap { Look.jpeg($0) }
         }
         guard let data, fm.fileExists(atPath: src.path), recipe == self.recipe(id) else { return false }
         return publishThumbnail(data, for: id)

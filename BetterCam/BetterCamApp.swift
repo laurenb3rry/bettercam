@@ -2,6 +2,8 @@ import SwiftUI
 
 @main
 struct BetterCamApp: App {
+    init() { Grade.warm() }
+
     var body: some Scene {
         WindowGroup {
             CameraView()
